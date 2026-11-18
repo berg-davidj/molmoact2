@@ -1,0 +1,74 @@
+# Left arm (mounted rotated 180 deg), red lid on the conveyor: pi0.5 fine-tune
+# hf://orchestrallabs/pi05-yam-red-lid-speedaug@120c476d. Cameras match the training data:
+# 640x480, and the center view is the D435 infrared stream (middle-ir), not color.
+# The Orchestral deployment or direct grant selects the model checkpoint.
+model_arm_side: left
+
+sensors:
+  cameras:
+    left_camera:
+      device_id: "/dev/yam-cameras/left"
+      width: 640
+      height: 480
+    front_camera:
+      device_id: "/dev/yam-cameras/middle-ir"
+      width: 640
+      height: 480
+    right_camera:
+      device_id: "/dev/yam-cameras/right"
+      width: 640
+      height: 480
+
+robot:
+  _target_: gello_min.yam.YAMRobot
+  channel: can_left
+
+agent:
+  start_joints: null
+
+hz: 15
+max_steps: 3000
+
+storage:
+  base_dir: "./yam_eval_runs"
+  task_directory: "pi05_red_lid_conveyor_left_arm"
+  language_instruction: "Pick up the red lid from the conveyor belt"
+  saver_max_workers: 2
+  png_compress_level: 1
+
+lerobot:
+  fps: 15
+  robot_type: "pi05_left_arm"
+  hf_repo_id: "local/yam_eval_session"
+  action_mode: "next_joint_fields"
+  vcodec: "libx264"
+  image_writer_processes: 2
+  image_writer_threads: 2
+  parallel_encoding: false
+  sanitize_online_viz_meta: true
+
+eval:
+  live_view_enabled: false
+  reproducibility:
+    # Match the pi0.5 primary config for reproducible per-query policy noise.
+    seed: 20260727
+    deterministic_algorithms: false
+  camera_preflight:
+    enabled: true
+    timeout_sec: 10
+    min_warmup_sec: 2.0
+    required_consecutive_frames: 2
+    expected_shape: [480, 640, 3]
+    max_clipped_white_fraction: 0.15
+  rerun:
+    enabled: true
+    image_stride: 6
+    jpeg_quality: 75
+    action_chunk_size: 30
+  server:
+    policy_adapter: pi05_yam_red_cap
+  mode: server
+  direct:
+    policy_adapter: pi05_yam_red_cap
+  camera_server:
+    enabled: false
