@@ -82,6 +82,37 @@ config/CLI. `configs/yam_left.yaml` ships `mode: http`; the physical-arm
 configs ship `mode: local`. Pass `--policy-mode server` to take the hosted path
 without editing a rollout YAML.
 
+### Local red-lid pi0.5 on Thor
+
+With the loopback Orchestral Worker running, launch the left-arm conveyor
+rollout with `examples/yam/run-rollout.sh`. Press Enter to reuse the configured
+instruction. The launcher uses H.264 at 15 Hz and requests the next plan with
+seven actions left in the current one.
+
+The script defaults to a sibling `orchestral` checkout and `i2rt` checkout.
+Set `YAM_PYTHON`, `ORCHESTRAL_PYTHON`, `I2RT_ROOT`, or `ORCHESTRAL_GRANT`
+to use a different robot interpreter, SDK interpreter, i2rt checkout, or Grant
+file.
+
+To start a Worker separately, use an Orchestral Worker Python environment with
+OpenPI, JAX CUDA 13, cuBLAS 13.2 or newer, and the native QUIC binary. Download
+`orchestrallabs/pi05-yam-red-lid-speedaug` at revision
+`120c476d4c3e394fff976b33d2ce728b194e84eb` into a local directory and run:
+
+```bash
+/path/to/worker-python examples/yam/start_local_pi05_worker.py \
+  --checkpoint /path/to/checkpoint \
+  --grant ../orchestral/.thor-pi05/grant
+```
+
+The Worker listens on loopback, creates a private Grant after warm-up, and
+removes it on shutdown. On a provisioned Thor checkout, you can use
+`../orchestral/.thor-pi05/runtime.sh` in place of `/path/to/worker-python`.
+Set `ORCHESTRAL_THOR_DEPS` to the verified dependency directory and pass
+absolute paths for the Python script, checkpoint, and Grant. Run one Worker
+on the Thor GPU. For LeRobot conversion, install LeRobot in the robot
+interpreter or in `.venv-lerobot` at the repository root.
+
 ### Switching deployment models
 
 For ABC-VLA, MolmoAct2, and other compatible YAM joint-position policies, use

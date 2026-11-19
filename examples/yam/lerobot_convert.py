@@ -57,11 +57,14 @@ Fixed to avoid OOM by using Lazy Loading of images.
 
 import argparse
 import json
+import logging
+import sys
 import gc
 import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image
@@ -71,6 +74,9 @@ from omegaconf import OmegaConf
 
 # LeRobot v3.0 API
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+
+logger = logging.getLogger(__name__)
 
 
 STATE_DIM_NAMES = [
@@ -435,7 +441,7 @@ def create_lerobot_dataset_v30(
         image_writer_processes=image_writer_processes,
         image_writer_threads=image_writer_threads,
         batch_encoding_size=1,
-        vcodec=vcodec,
+        vcodec="h264" if vcodec == "libx264" else vcodec,
     )
 
     for ep_idx, ep_data in enumerate(tqdm.tqdm(episodes, desc="Processing Episodes")):
@@ -588,6 +594,61 @@ def load_defaults_from_yaml(config_path: str) -> Dict[str, Any]:
     return defaults
 
 
+def convert_session_to_lerobot(
+    session_rollout_dirs: Sequence[Path],
+    output_dir: Path,
+    fps: int,
+    robot_type: str,
+    repo_id: str = "local/eval_session",
+    action_mode: str = "next_joint_fields",
+    vcodec: str = "libsvtav1",
+    sanitize_online_viz_meta: bool = True,
+    image_writer_processes: int = 0,
+    image_writer_threads: int = 0,
+    parallel_encoding: bool = True,
+) -> Optional[Path]:
+    """Convert the labeled rollouts from this eval session into one LeRobot v3.0 dataset.
+
+    Calls into the existing ``create_lerobot_dataset_v30`` so the dataset schema
+    stays identical to the data-collection pipeline. Returns the final output
+    path (may differ from ``output_dir`` if a uniqueness suffix was applied to
+    avoid a non-empty-directory collision).
+    """
+    if not session_rollout_dirs:
+        logger.info("No labeled rollouts to convert.")
+        return None
+
+    output_dir = Path(output_dir)
+    if output_dir.exists() and any(output_dir.iterdir()):
+        suffix = datetime.now().strftime("_%H%M%S")
+        output_dir = output_dir.parent / f"{output_dir.name}{suffix}"
+        logger.warning("Output dir non-empty; using %s instead.", output_dir)
+
+    episodes = load_droid_layout_data(
+        base_dir=None,
+        explicit_paths=[Path(p) for p in session_rollout_dirs],
+    )
+    if not episodes:
+        logger.error("No usable episodes from this session — skipping conversion.")
+        return None
+
+    create_lerobot_dataset_v30(
+        episodes=episodes,
+        output_dir=str(output_dir),
+        repo_id=repo_id,
+        fps=fps,
+        robot_type=robot_type,
+        action_mode=action_mode,
+        sanitize_online_viz_meta=sanitize_online_viz_meta,
+        vcodec=vcodec,
+        image_writer_processes=image_writer_processes,
+        image_writer_threads=image_writer_threads,
+        parallel_encoding=parallel_encoding,
+    )
+    logger.info("LeRobot dataset written: %s", output_dir)
+    return output_dir
+
+
 def main():
     bootstrap_parser = argparse.ArgumentParser(add_help=False)
     bootstrap_parser.add_argument(
@@ -596,7 +657,12 @@ def main():
         default="../gello_software/configs/yam_left.yaml",
         help="Path to launch yaml used for default converter settings.",
     )
+    bootstrap_parser.add_argument("--session-plan", action="store_true", help=argparse.SUPPRESS)
     bootstrap_args, _ = bootstrap_parser.parse_known_args()
+    if bootstrap_args.session_plan:
+        logging.basicConfig(level=logging.INFO)
+        convert_session_to_lerobot(**json.load(sys.stdin))
+        return
     config_defaults = load_defaults_from_yaml(bootstrap_args.config_path)
 
     parser = argparse.ArgumentParser(parents=[bootstrap_parser])

@@ -21,11 +21,14 @@ import concurrent.futures
 import json
 import logging
 import os
+import select
 import subprocess
 import sys
 import time
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import count
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Literal, Mapping, Optional, Tuple
 
@@ -46,6 +49,7 @@ from eval_utils import (
     move_rollout,
     prompt_instruction,
     resolve_label,
+    rollout_number,
 )
 from gello_min.robot import BimanualRobot
 from gello_min.launch_utils import instantiate_from_dict, move_to_start_position
@@ -512,14 +516,10 @@ class Args:
     the whole chunk. Overrides eval.exec_steps."""
 
     prefetch_lead_steps: int = 0
-    """Fire the next inference this many control steps BEFORE the current chunk
-    ends, from a fresh observation captured at that moment, and splice the reply
-    in at the row matching elapsed wall-clock — continuous motion, no boundary
-    freeze. ON by default (18 steps = 0.6 s at 30 Hz, covering the ~0.5 s act).
-    Set 0 for the legacy stop-and-replan behavior. The historical prefetch was
-    reverted because it entered the new absolute-pose chunk at row 0 and drove
-    the arm backward; the elapsed-row splice is the fix (orchestral run_chunked's
-    design)."""
+    """How many remaining actions trigger prefetch. Committed async defaults to half the model horizon."""
+
+    async_committed_actions: bool = False
+    """Overlap Orchestral Predictions using the remaining actions as a committed prefix."""
 
     replan_settle_s: float = 0.0
     """Dwell this long at each chunk boundary (after the first) before capturing the
@@ -537,8 +537,11 @@ class Args:
     confirm_bimanual_clearance: bool = False
     """Required for active dual-arm motion after the operator verifies a clear, separated start pose."""
 
-    num_rollouts: Annotated[int, tyro.conf.arg(aliases=("-n",))] = 1
-    """How many rollouts to run in this session."""
+    num_rollouts: Annotated[Optional[int], tyro.conf.arg(aliases=("-n",))] = None
+    """Cap the rollouts in this session. Defaults to unlimited in terminal mode, one otherwise."""
+
+    terminal_rollout_controls: bool = False
+    """End and label each rollout from the terminal with y/n/q followed by Enter."""
 
 
 def has_explicit_both_arm_cli_opt_in(args: Args) -> bool:
@@ -1497,24 +1500,41 @@ def print_execution_bracket(
         )
 
 
+def _terminal_rollout_outcome(completed_steps: int) -> Optional[RolloutOutcome]:
+    if not select.select([sys.stdin], [], [], 0)[0]:
+        return None
+    line = sys.stdin.readline()
+    if not line:
+        raise KeyboardInterrupt
+    reason = {"y": "success", "n": "failure", "q": "quit"}.get(line.strip().lower())
+    if reason is None:
+        print("[rollout] Type y (success), n (failure), or q (unlabeled), then Enter.", flush=True)
+        return None
+    return RolloutOutcome(end_reason=reason, last_step=completed_steps)
+
+
 def run_one_rollout(
     env: RobotEnv,
     policy: PolicyBase,
     saver: EvalRolloutSaver,
     instruction: str,
     rollout_idx: int,
-    num_rollouts: int,
+    num_rollouts: Optional[int],
     max_steps: int,
     live_view: LiveCameraView,
     execution_mask: Optional[BimanualActiveArmHoldMask] = None,
     replan_settle_s: float = 0.0,
     prefetch_lead_steps: int = 0,
     exec_steps: Optional[int] = None,
+    terminal_rollout_controls: bool = False,
+    async_committed_actions: bool = False,
+    prefetch_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None,
 ) -> RolloutOutcome:
     """Execute one rollout and buffer per-step observations into ``saver``.
 
     End conditions:
 
+    * terminal y/n/q followed by Enter when terminal controls are enabled
     * ``cv2`` keypress ``y`` -> success (labeled)
     * ``cv2`` keypress ``n`` -> failure (labeled)
     * ``cv2`` keypress ``q`` -> quit (no label; rollout stays in ``eval/``)
@@ -1530,8 +1550,12 @@ def run_one_rollout(
     policy_inference_metadata: Dict[str, Any] = {}
     chunk_started_at: Optional[float] = None
 
-    def infer(obs_for_policy: Dict[str, Any]) -> Tuple[np.ndarray, float, Dict[str, Any]]:
+    def infer(
+        obs_for_policy: Dict[str, Any], committed: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, float, Dict[str, Any]]:
         input_dict = policy.prepare_input(obs_for_policy, instruction)
+        if committed is not None:
+            input_dict["committed_actions"] = committed
         t0 = time.perf_counter()
         policy_result = policy.inference(input_dict)
         result = policy_result["actions"]
@@ -1569,30 +1593,41 @@ def run_one_rollout(
             },
             "instruction_sent": input_dict.get("instruction", instruction),
         }
+        if committed is not None:
+            record["committed_action_count"] = len(committed)
         transport = policy_result.get("transport")
         if isinstance(transport, Mapping):
             record["transport"] = dict(transport)
         reproducibility = {**reproducibility, **record}
         return np.asarray(result, dtype=np.float32), inference_sec, reproducibility
 
-    prefetch_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+    def prefetch(obs_for_policy: Dict[str, Any], committed: Optional[np.ndarray]):
+        result = infer(obs_for_policy, committed)
+        return result, time.monotonic()
+
     prefetch_future: Optional[concurrent.futures.Future] = None
-    prefetch_capture_step: Optional[int] = None
+    prefetch_capture_step = 0
+    prefetch_started_at = 0.0
+    committed_count = 0
     chunk_start_row = 0
     # The last row of the current plan this rollout will execute. ``exec_steps``
     # caps it below the model's full horizon so one hot draw commands at most
     # that many rows before a fresh observation replaces it.
     chunk_rows_end = 0
-    if prefetch_lead_steps > 0:
-        prefetch_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    if prefetch_lead_steps > 0 and prefetch_pool is None:
+        raise ValueError("Prefetch requires a rollout-owned executor")
 
     for step in range(max_steps):
-        # MolmoAct's YAM checkpoint predicts *absolute* joint targets.  A
-        # prediction prefetched before the current chunk finishes is therefore
-        # stale at the next boundary and can command the arm back toward its
-        # old pose.  Always replan from a fresh observation instead.  The
-        # I2RT motor-control thread continuously holds the previous target
-        # while inference runs, so this does not starve the motor watchdog.
+        if terminal_rollout_controls:
+            outcome = _terminal_rollout_outcome(step)
+            if outcome is not None:
+                return outcome
+        # Evaluate the deadline before reading cameras at the chunk boundary.
+        boundary_at = time.monotonic()
+        missed_boundary = (
+            async_committed_actions and chunk_index >= chunk_rows_end
+            and prefetch_future is not None and not prefetch_future.done()
+        )
         obs_pre = env.get_obs()
         if action_chunk is None or chunk_index >= chunk_rows_end:
             if action_chunk is not None and chunk_started_at is not None:
@@ -1614,26 +1649,49 @@ def run_one_rollout(
                     obs_pre = env.get_obs()
             splice_index = 0
             if prefetch_future is not None:
-                action_chunk, policy_inference_sec, policy_inference_metadata = (
-                    prefetch_future.result()
-                )
-                # Enter the prefetched absolute-pose chunk at the row matching
-                # wall-clock progress since its observation was captured: the
-                # earlier rows describe poses already in the past and would
-                # command the arm backward.
-                elapsed_rows = max(0, step - int(prefetch_capture_step))
-                splice_index = min(elapsed_rows, len(action_chunk) - 1)
-                policy_inference_metadata = {
-                    **(policy_inference_metadata or {}),
-                    "prefetch_splice_index": int(splice_index),
-                    "prefetch_capture_step": int(prefetch_capture_step),
-                }
+                # The SDK Session has stateful codecs. Drain the current
+                # request before fetching again, even if we discard its plan.
+                if missed_boundary:
+                    logger.warning("Committed Prediction missed the boundary; holding and replanning")
+                prefetched, ready_at = prefetch_future.result()
                 prefetch_future = None
-                prefetch_capture_step = None
-                logger.info(
-                    "Spliced prefetched plan at row %d (continuous motion)",
-                    splice_index,
-                )
+                if async_committed_actions:
+                    prefetch_timing = {
+                        "prefetch_elapsed_ms": (ready_at - prefetch_started_at) * 1000.0,
+                        "prefetch_deadline_margin_ms": (boundary_at - ready_at) * 1000.0,
+                    }
+                    logger.info(
+                        "Committed Prediction took %.1f ms; handoff margin %.1f ms",
+                        prefetch_timing["prefetch_elapsed_ms"],
+                        prefetch_timing["prefetch_deadline_margin_ms"],
+                    )
+                if missed_boundary:
+                    if terminal_rollout_controls:
+                        outcome = _terminal_rollout_outcome(step)
+                        if outcome is not None:
+                            return outcome
+                    obs_pre = env.get_obs()
+                    action_chunk, policy_inference_sec, policy_inference_metadata = infer(obs_pre)
+                    policy_inference_metadata["discarded_late_prediction_sec"] = prefetched[1]
+                    discarded_transport = prefetched[2].get("transport")
+                    if discarded_transport is not None:
+                        policy_inference_metadata["discarded_late_prediction_transport"] = discarded_transport
+                    policy_inference_metadata.update(prefetch_timing)
+                else:
+                    action_chunk, policy_inference_sec, policy_inference_metadata = prefetched
+                    consumed = step - prefetch_capture_step
+                    if async_committed_actions:
+                        if consumed != committed_count or not 0 < consumed < len(action_chunk):
+                            raise RuntimeError("Committed actions do not align with the executed prefix")
+                        splice_index = consumed
+                        policy_inference_metadata.update(prefetch_timing)
+                    else:
+                        splice_index = min(consumed, len(action_chunk) - 1)
+                    policy_inference_metadata.update(
+                        prefetch_splice_index=splice_index,
+                        prefetch_capture_step=prefetch_capture_step,
+                    )
+                    logger.info("Spliced prefetched plan at row %d", splice_index)
             else:
                 action_chunk, policy_inference_sec, policy_inference_metadata = infer(obs_pre)
             expected_dofs = env.robot().num_dofs()
@@ -1713,24 +1771,37 @@ def run_one_rollout(
                 )
             chunk_started_at = time.monotonic()
 
+        remaining = chunk_rows_end - chunk_index
+        # In committed mode all available rows may be committed as soon as
+        # we install a plan. The other mode still waits for a command first.
+        trigger = prefetch_lead_steps
+        if not async_committed_actions:
+            trigger = min(trigger, max(1, chunk_rows_end - chunk_start_row - 1))
         if (
             prefetch_pool is not None
             and prefetch_future is None
             and action_chunk is not None
-            and (chunk_rows_end - chunk_index)
-            <= min(max(1, prefetch_lead_steps), max(1, chunk_rows_end - chunk_start_row - 1))
+            and 0 < remaining < max_steps - step
+            and remaining <= trigger
         ):
             # Fresh observation captured NOW (main thread), inference overlapped
             # with the remainder of this chunk's execution. One in flight max.
             prefetch_capture_step = step
-            prefetch_observation = env.get_obs()
-            # The main loop saves ``obs_pre`` for this step; this is a second,
-            # later capture that only the policy sees. Saving it under its own
-            # camera keys is what makes a prefetched act replayable at all --
-            # and it rides the saver's existing bounded async writer, so the
-            # control loop pays a queue put, not a PNG encode.
+            prefetch_started_at = time.monotonic()
+            prefetch_observation = obs_pre if async_committed_actions else env.get_obs()
+            committed = action_chunk[chunk_index:chunk_rows_end].copy() if async_committed_actions else None
+            committed_count = len(committed) if committed is not None else 0
+            prefetch_future = prefetch_pool.submit(prefetch, prefetch_observation, committed)
             saver.add_policy_observation(step, prefetch_observation)
-            prefetch_future = prefetch_pool.submit(infer, prefetch_observation)
+            if committed is not None:
+                logger.info("Requested next plan with %d committed actions", committed_count)
+
+        # If inference was in flight when the operator ended the rollout,
+        # save it before issuing another motor command.
+        if terminal_rollout_controls:
+            outcome = _terminal_rollout_outcome(step)
+            if outcome is not None:
+                return outcome
 
         action_index_in_chunk = chunk_index
         policy_action = action_chunk[action_index_in_chunk]
@@ -1753,7 +1824,7 @@ def run_one_rollout(
             policy_chunk_index=policy_chunk_index,
             policy_action_index=action_index_in_chunk,
             policy_inference_sec=(
-                policy_inference_sec if action_index_in_chunk == 0 else float("nan")
+                policy_inference_sec if action_index_in_chunk == chunk_start_row else float("nan")
             ),
         )
 
@@ -1831,7 +1902,7 @@ def run_session(
     left_cfg: Dict[str, Any],
     right_cfg: Optional[Dict[str, Any]],
     bimanual: bool,
-    num_rollouts: int,
+    num_rollouts: Optional[int],
     execution_mask: Optional[BimanualActiveArmHoldMask] = None,
     *,
     seed_plan: Optional[RolloutSeedPlan] = None,
@@ -1841,6 +1912,9 @@ def run_session(
     primary_config_path: Optional[str] = None,
     secondary_config_path: Optional[str] = None,
     process_seed_metadata: Optional[Dict[str, Any]] = None,
+    terminal_rollout_controls: bool = False,
+    async_committed_actions: bool = False,
+    post_session: Optional[ExitStack] = None,
 ) -> SessionResult:
     """Drive ``num_rollouts`` rollouts; convert the labeled set to LeRobot at the end.
 
@@ -1884,7 +1958,8 @@ def run_session(
     outcome: Optional[RolloutOutcome] = None
 
     try:
-        for rollout_idx in range(num_rollouts):
+        rollout_indices = count() if num_rollouts is None else range(num_rollouts)
+        for rollout_idx in rollout_indices:
             move_to_rollout_start(
                 env,
                 bimanual=bimanual,
@@ -1892,10 +1967,12 @@ def run_session(
                 right_cfg=right_cfg,
                 execution_mask=execution_mask,
             )
-            instruction = with_active_arm_instruction(
-                prompt_instruction(rollout_idx, num_rollouts, last_prompt),
-                instruction_side,
+            task = prompt_instruction(
+                rollout_idx, num_rollouts, last_prompt, allow_finish=terminal_rollout_controls,
             )
+            if task is None:
+                break
+            instruction = with_active_arm_instruction(task, instruction_side)
             last_prompt = instruction
 
             # Reset a local policy's generator stream before the first model
@@ -1923,6 +2000,11 @@ def run_session(
             )
             if execution_mask is not None:
                 rollout_manifest["execution"] = execution_mask.manifest_metadata()
+            rollout_manifest["planning"] = {
+                "committed_async": async_committed_actions,
+                "prefetch_lead_steps": prefetch_lead_steps,
+                "exec_steps": exec_steps,
+            }
             if policy_rollout_metadata:
                 rollout_manifest["policy"]["rollout"] = policy_rollout_metadata
 
@@ -1936,24 +2018,36 @@ def run_session(
                 rollout_manifest=rollout_manifest,
             )
 
-            print(f"\n--- Rollout {rollout_idx + 1}/{num_rollouts} ---")
+            print(f"\n--- Rollout {rollout_number(rollout_idx, num_rollouts)} ---")
             print(f"  instruction: {instruction}")
             print(f"  rollout_dir: {rollout_dir}")
+            if terminal_rollout_controls:
+                print("  End this object: y = success, n = failure, q = unlabeled (then Enter).")
 
-            outcome = run_one_rollout(
-                env=env,
-                policy=policy,
-                saver=saver,
-                instruction=instruction,
-                rollout_idx=rollout_idx,
-                num_rollouts=num_rollouts,
-                max_steps=max_steps,
-                live_view=live_view,
-                execution_mask=execution_mask,
-                replan_settle_s=float(replan_settle_s),
-                prefetch_lead_steps=int(prefetch_lead_steps),
-                exec_steps=exec_steps,
+            executor = (
+                concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                if prefetch_lead_steps > 0 else nullcontext()
             )
+            # Drain any remaining request before beginning another rollout
+            # or closing the shared policy Session.
+            with executor as prefetch_pool:
+                outcome = run_one_rollout(
+                    env=env,
+                    policy=policy,
+                    saver=saver,
+                    instruction=instruction,
+                    rollout_idx=rollout_idx,
+                    num_rollouts=num_rollouts,
+                    max_steps=max_steps,
+                    live_view=live_view,
+                    execution_mask=execution_mask,
+                    replan_settle_s=float(replan_settle_s),
+                    prefetch_lead_steps=int(prefetch_lead_steps),
+                    exec_steps=exec_steps,
+                    terminal_rollout_controls=terminal_rollout_controls,
+                    async_committed_actions=async_committed_actions,
+                    prefetch_pool=prefetch_pool,
+                )
 
             saver.flush()
             label = resolve_label(outcome)
@@ -2010,7 +2104,10 @@ def run_session(
         raise
     finally:
         live_view.close()
-        _convert_if_any(labeled_rollouts, base_save_dir, session_timestamp, left_cfg)
+        if post_session is None:
+            _convert_if_any(labeled_rollouts, base_save_dir, session_timestamp, left_cfg)
+        else:
+            post_session.callback(_convert_if_any, labeled_rollouts, base_save_dir, session_timestamp, left_cfg)
 
     return SessionResult(
         saved_rollouts=saved_rollouts,
@@ -2034,22 +2131,34 @@ def _convert_if_any(
     output_dir = base_save_dir / "eval_lerobot_v30" / session_timestamp
     print(
         f"\n[session] Converting {len(labeled_rollouts)} labeled rollouts "
-        f"to LeRobot v3.0 at {output_dir} ..."
+        f"to LeRobot v3.0 at {output_dir} ...",
+        flush=True,
     )
+    plan = dict(
+        session_rollout_dirs=[str(path) for path in labeled_rollouts],
+        output_dir=str(output_dir),
+        fps=int(lerobot_cfg.get("fps", left_cfg.get("hz", 30))),
+        robot_type=str(lerobot_cfg.get("robot_type", "molmoact_dual_arm")),
+        repo_id=str(lerobot_cfg.get("hf_repo_id", "local/eval_session")),
+        action_mode=str(lerobot_cfg.get("action_mode", "next_joint_fields")),
+        vcodec=str(lerobot_cfg.get("vcodec", "libsvtav1")),
+        sanitize_online_viz_meta=bool(lerobot_cfg.get("sanitize_online_viz_meta", True)),
+        image_writer_processes=int(lerobot_cfg.get("image_writer_processes", 0)),
+        image_writer_threads=int(lerobot_cfg.get("image_writer_threads", 0)),
+        parallel_encoding=bool(lerobot_cfg.get("parallel_encoding", True)),
+    )
+    converter = Path(__file__).with_name("lerobot_convert.py").resolve()
+    converter_python = converter.parents[2] / ".venv-lerobot" / "bin" / "python"
     try:
-        convert_session_to_lerobot(
-            session_rollout_dirs=labeled_rollouts,
-            output_dir=output_dir,
-            fps=int(lerobot_cfg.get("fps", left_cfg.get("hz", 30))),
-            robot_type=str(lerobot_cfg.get("robot_type", "molmoact_dual_arm")),
-            repo_id=str(lerobot_cfg.get("hf_repo_id", "local/eval_session")),
-            action_mode=str(lerobot_cfg.get("action_mode", "next_joint_fields")),
-            vcodec=str(lerobot_cfg.get("vcodec", "libsvtav1")),
-            sanitize_online_viz_meta=bool(lerobot_cfg.get("sanitize_online_viz_meta", True)),
-            image_writer_processes=int(lerobot_cfg.get("image_writer_processes", 0)),
-            image_writer_threads=int(lerobot_cfg.get("image_writer_threads", 0)),
-            parallel_encoding=bool(lerobot_cfg.get("parallel_encoding", True)),
-        )
+        if converter_python.is_file():
+            subprocess.run(
+                [str(converter_python), str(converter), "--session-plan"],
+                input=json.dumps(plan),
+                text=True,
+                check=True,
+            )
+        else:
+            convert_session_to_lerobot(**plan)
     except Exception as exc:  # noqa: BLE001 — keep raw rollouts even if conversion fails
         logger.exception("LeRobot conversion failed: %s", exc)
 
@@ -2068,8 +2177,13 @@ def main() -> None:
     atexit.register(_shutdown_runtime)
 
     args = tyro.cli(Args)
-    if args.num_rollouts < 1:
-        raise SystemExit("--num_rollouts must be >= 1")
+    if args.terminal_rollout_controls and not sys.stdin.isatty():
+        raise SystemExit("--terminal-rollout-controls requires an interactive terminal.")
+    num_rollouts = args.num_rollouts
+    if num_rollouts is not None and num_rollouts < 1:
+        raise SystemExit("--num-rollouts must be >= 1")
+    if num_rollouts is None and not args.terminal_rollout_controls:
+        num_rollouts = 1
 
     # Load the policy before powering/starting the robot control thread.  The
     # model may take seconds to load; leaving an active CAN control loop running
@@ -2225,6 +2339,30 @@ def main() -> None:
         print(f"[orchestral] camera mapping: {identity.get('camera_mapping')}")
         print(f"[orchestral] policy adapter: {identity.get('policy_adapter', 'identity')}")
     exec_steps = resolve_exec_steps(args.exec_steps, eval_cfg)
+    lead_steps = args.prefetch_lead_steps
+    if lead_steps < 0:
+        raise SystemExit("--prefetch-lead-steps must be nonnegative.")
+    if args.async_committed_actions:
+        if (not isinstance(policy, MolmoActOrchestral)
+                or identity.get("policy_adapter") != "pi05_yam_red_cap"
+                or identity.get("state_dim") != 7
+                or policy.single_arm_side != execution_mask.active_arm_side
+                or execution_mask.execution_mode != "active_arm_hold"
+                or execution_mask.both_arm_max_delta is not None):
+            raise SystemExit("Committed mode requires the single active pi0.5 arm with unchanged queued targets.")
+        horizon = policy.get_action_horizon()
+        # A prefix of K leaves H-K new rows. At most floor(H/2)
+        # can be committed on every cycle without shortening the next lead.
+        lead_steps = lead_steps or min(horizon // 2, exec_steps or horizon)
+        if not 0 < lead_steps < horizon or (exec_steps is not None and lead_steps > exec_steps):
+            raise SystemExit("Committed lead must fit in the executed action budget and leave a new suffix.")
+        if not policy.supports_committed_actions():
+            raise SystemExit("The Worker does not support committed actions.")
+        control_hz = float(raw_left_cfg.get("hz", 30))
+        print(
+            f"[orchestral] Committed async mode, up to {lead_steps} queued actions "
+            f"({1000 * lead_steps / control_hz:.0f} ms at {control_hz:g} Hz) per request."
+        )
     print_execution_bracket(
         exec_steps=exec_steps,
         action_horizon=(
@@ -2248,6 +2386,7 @@ def main() -> None:
     _bimanual_execution_mask = execution_mask
 
     session_result = SessionResult(saved_rollouts=[], clean_exit=False)
+    post_session = ExitStack()
     try:
         capture_rest_pose_at_startup(
             env,
@@ -2265,7 +2404,7 @@ def main() -> None:
         print(f"Launching robot: {env.robot().__class__.__name__}")
         print(f"Control loop: {left_cfg.get('hz', 30)} Hz")
         print(
-            f"Rollouts this session: {args.num_rollouts}, "
+            f"Rollouts this session: {num_rollouts if num_rollouts is not None else 'until finished'}, "
             f"max_steps: {left_cfg.get('max_steps', 1000)}"
         )
 
@@ -2275,15 +2414,18 @@ def main() -> None:
             left_cfg=left_cfg,
             right_cfg=right_cfg,
             bimanual=bimanual,
-            num_rollouts=args.num_rollouts,
+            num_rollouts=num_rollouts,
             execution_mask=execution_mask,
             seed_plan=seed_plan,
             replan_settle_s=float(args.replan_settle_s),
-            prefetch_lead_steps=int(args.prefetch_lead_steps),
+            prefetch_lead_steps=lead_steps,
             exec_steps=exec_steps,
+            async_committed_actions=args.async_committed_actions,
             primary_config_path=args.config_path,
             secondary_config_path=args.right_config_path,
             process_seed_metadata=process_seed_metadata,
+            terminal_rollout_controls=args.terminal_rollout_controls,
+            post_session=post_session,
         )
         # A completed session or an operator-issued Ctrl-C both make teardown
         # eligible to move the robot back to its captured pose (bounded and
@@ -2296,7 +2438,10 @@ def main() -> None:
         # Close robot/CAN and V4L2 resources before any post-rollout
         # visualization work. A hung exporter must never retain the controller
         # or cameras after motion is over.
-        _shutdown_runtime()
+        try:
+            _shutdown_runtime()
+        finally:
+            post_session.close()
 
     if session_result.saved_rollouts:
         print(

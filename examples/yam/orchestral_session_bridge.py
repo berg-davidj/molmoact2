@@ -10,6 +10,9 @@ import math
 import re
 import struct
 import sys
+import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -344,6 +347,39 @@ def write_frame(stream: Any, header: Mapping[str, Any], buffers: Sequence[bytes]
 # ---------------------------------------------------------------------------
 
 
+@contextmanager
+def _startup_step(description: str):
+    """Report slow SDK startup steps on stderr, leaving stdout for IPC."""
+    started = time.monotonic()
+    done = threading.Event()
+
+    def report_wait():
+        while not done.wait(10):
+            print(
+                f"[orchestral bridge] Still {description} "
+                f"({time.monotonic() - started:.0f}s)",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def report(message: str):
+        print(f"[orchestral bridge] {message}", file=sys.stderr, flush=True)
+
+    report(f"Starting: {description}")
+    monitor = threading.Thread(target=report_wait, daemon=True)
+    monitor.start()
+    try:
+        yield
+    except Exception:
+        report(f"Failed while {description} ({time.monotonic() - started:.1f}s)")
+        raise
+    else:
+        report(f"Done: {description} ({time.monotonic() - started:.1f}s)")
+    finally:
+        done.set()
+        monitor.join()
+
+
 class OrchestralSessionHost:
     """One Orchestral prediction session for the entire evaluation."""
 
@@ -406,7 +442,41 @@ class OrchestralSessionHost:
                              observation_encoding=self.observation_encoding)
         return dict(self.identity)
 
-    def act(self, images, state, instruction=None, noise_seed=None):
+    def supports_committed_actions(self):
+        if self._session is None:
+            raise OrchestralBridgeError("Orchestral session is not open")
+        session = self._session
+        query = getattr(type(session), "supports_committed_actions", None)
+        if query is not None and session.supports_committed_actions:
+            return True
+
+        # Older Workers echo ORC6 even when their model supports prefixes.
+        # Verify through an actual Prediction before opening CAN on those Workers.
+        exchange = getattr(session._transport, "_exchange_codec_selection", None)
+        reply = exchange(b"ORC6") if exchange is not None else None
+        if reply == b"ORC6\x01":
+            return True
+        if reply != b"ORC6" or self.policy_adapter != "pi05_yam_red_cap":
+            return False
+
+        import numpy as np
+
+        image = np.zeros((16, 16, 3), dtype=np.uint8)
+        prefix = [[0.01, -0.02, 0.03, -0.04, 0.05, -0.06, 0.25]]
+        with _startup_step("verifying a committed action on the Worker before motor startup"):
+            try:
+                self.act(
+                    {key: image for key in CAMERA_KEYS},
+                    [0.0] * 6 + [0.5],
+                    instruction=self.instruction or "Pick up the red lid from the conveyor belt.",
+                    noise_seed=0,
+                    committed_actions=prefix,
+                )
+            finally:
+                self.begin_episode()
+        return True
+
+    def act(self, images, state, instruction=None, noise_seed=None, committed_actions=None):
         import numpy as np
         from dataclasses import asdict
         if self._session is None:
@@ -424,8 +494,23 @@ class OrchestralSessionHost:
         inputs["state"] = query_state.copy()
         if self.policy_adapter == "pi05_yam_red_cap":
             inputs["state"][6] = 1.0 - np.clip(query_state[6], 0.0, 1.0)
-        result = self._session.predict(inputs=inputs, instruction=instruction or self.instruction,
-                                       episode_start=self._episode_start, noise_seed=noise_seed)
+        prefix = None
+        if committed_actions is not None:
+            prefix = np.array(committed_actions, dtype=np.float32, copy=True)
+            if (prefix.ndim != 2 or prefix.shape[1] != self.identity["action_dim"]
+                    or not 0 < len(prefix) < self.identity["action_horizon"]
+                    or not np.isfinite(prefix).all()):
+                raise OrchestralBridgeError("Committed actions must be a finite prefix shorter than the horizon")
+            if self.policy_adapter == "pi05_yam_red_cap":
+                # Undo the same adapter used for each returned plan, using
+                # this request's observation as the origin for joint deltas.
+                prefix[:, :6] -= query_state[:6]
+                prefix[:, 6] = 1.0 - prefix[:, 6]
+        result = self._session.predict(
+            inputs=inputs, instruction=instruction or self.instruction,
+            episode_start=self._episode_start, noise_seed=noise_seed,
+            **({"committed_actions": prefix} if prefix is not None else {}),
+        )
         self._episode_start = False
         actions = np.asarray(result.actions, dtype=np.float32).copy()
         if actions.shape != (self.identity["action_horizon"], self.identity["action_dim"]) or not np.isfinite(actions).all():
@@ -556,8 +641,13 @@ def _handle(host_ref: Dict[str, Any], header: Dict[str, Any], buffers: List[byte
                 header.get("state") or [],
                 instruction=header.get("instruction"),
                 noise_seed=header.get("noise_seed"),
+                committed_actions=header.get("committed_actions"),
             ),
         }
+    if op == "supports_committed_actions":
+        if host is None:
+            raise OrchestralBridgeError("capability query requested before open")
+        return {"ok": True, "supported": host.supports_committed_actions()}
     if op == "begin_episode":
         if host is None:
             raise OrchestralBridgeError("begin_episode requested before open")

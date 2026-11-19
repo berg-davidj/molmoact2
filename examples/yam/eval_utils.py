@@ -657,11 +657,11 @@ class LiveCameraView:
         header_h = 90
         header = np.zeros((header_h, width, 3), dtype=np.uint8)
         rollout_idx = int(hdr.get("rollout_idx", 0))
-        num_rollouts = int(hdr.get("num_rollouts", 1))
+        num_rollouts = hdr.get("num_rollouts", 1)
         step = int(hdr.get("step", 0))
         max_steps = int(hdr.get("max_steps", 1))
         instruction = str(hdr.get("instruction", ""))
-        first_line = f"Rollout {rollout_idx + 1}/{num_rollouts}    Step {step}/{max_steps}"
+        first_line = f"Rollout {rollout_number(rollout_idx, num_rollouts)}    Step {step}/{max_steps}"
         if stale_sec is not None and stale_sec > 1.0:
             first_line = f"{first_line}    [stale {stale_sec:.1f}s]"
         lines = [
@@ -690,7 +690,7 @@ class LiveCameraView:
         self,
         obs: Dict[str, Any],
         rollout_idx: int,
-        num_rollouts: int,
+        num_rollouts: Optional[int],
         step: int,
         max_steps: int,
         instruction: str,
@@ -743,7 +743,7 @@ class LiveCameraView:
         self,
         obs: Dict[str, Any],
         rollout_idx: int,
-        num_rollouts: int,
+        num_rollouts: Optional[int],
         step: int,
         max_steps: int,
         instruction: str,
@@ -802,15 +802,26 @@ class LiveCameraView:
 # ---------------------------------------------------------------------------
 
 
-def prompt_instruction(rollout_idx: int, num_rollouts: int, last_prompt: str) -> str:
-    """Ask user for the task instruction for this rollout.
+def rollout_number(rollout_idx: int, num_rollouts: Optional[int]) -> str:
+    number = str(rollout_idx + 1)
+    return number if num_rollouts is None else f"{number}/{num_rollouts}"
 
-    Empty input → reuse ``last_prompt``.
-    """
+
+def prompt_instruction(
+    rollout_idx: int,
+    num_rollouts: Optional[int],
+    last_prompt: str,
+    *,
+    allow_finish: bool = False,
+) -> Optional[str]:
+    """Ask for this rollout's task, or return None when the operator ends the batch."""
+    finish_hint = ", q to finish batch" if allow_finish else ""
     text = input(
-        f"\n[rollout {rollout_idx + 1}/{num_rollouts}] "
-        f"Task instruction (Enter to reuse '{last_prompt}'): "
+        f"\n[rollout {rollout_number(rollout_idx, num_rollouts)}] "
+        f"Task instruction (Enter to reuse '{last_prompt}'{finish_hint}): "
     ).strip()
+    if allow_finish and text.lower() == "q":
+        return None
     return text if text else last_prompt
 
 
@@ -891,11 +902,6 @@ def move_rollout(rollout_dir: Path, label: str, base_save_dir: Path) -> Path:
     return dest
 
 
-# ---------------------------------------------------------------------------
-# End-of-session LeRobot conversion
-# ---------------------------------------------------------------------------
-
-
 def convert_session_to_lerobot(
     session_rollout_dirs: Sequence[Path],
     output_dir: Path,
@@ -909,46 +915,11 @@ def convert_session_to_lerobot(
     image_writer_threads: int = 0,
     parallel_encoding: bool = True,
 ) -> Optional[Path]:
-    """Convert the labeled rollouts from this eval session into one LeRobot v3.0 dataset.
+    """Convert saved rollouts using the current Python environment."""
+    from lerobot_convert import convert_session_to_lerobot as convert
 
-    Calls into the existing ``create_lerobot_dataset_v30`` so the dataset schema
-    stays identical to the data-collection pipeline. Returns the final output
-    path (may differ from ``output_dir`` if a uniqueness suffix was applied to
-    avoid a non-empty-directory collision).
-    """
-    if not session_rollout_dirs:
-        logger.info("No labeled rollouts to convert.")
-        return None
-
-    # Imported here (not at module load) so rollouts run without `lerobot`.
-    from lerobot_convert import create_lerobot_dataset_v30, load_droid_layout_data
-
-    output_dir = Path(output_dir)
-    if output_dir.exists() and any(output_dir.iterdir()):
-        suffix = datetime.now().strftime("_%H%M%S")
-        output_dir = output_dir.parent / f"{output_dir.name}{suffix}"
-        logger.warning("Output dir non-empty; using %s instead.", output_dir)
-
-    episodes = load_droid_layout_data(
-        base_dir=None,
-        explicit_paths=[Path(p) for p in session_rollout_dirs],
+    return convert(
+        session_rollout_dirs, output_dir, fps, robot_type, repo_id, action_mode,
+        vcodec, sanitize_online_viz_meta, image_writer_processes, image_writer_threads,
+        parallel_encoding,
     )
-    if not episodes:
-        logger.error("No usable episodes from this session — skipping conversion.")
-        return None
-
-    create_lerobot_dataset_v30(
-        episodes=episodes,
-        output_dir=str(output_dir),
-        repo_id=repo_id,
-        fps=fps,
-        robot_type=robot_type,
-        action_mode=action_mode,
-        sanitize_online_viz_meta=sanitize_online_viz_meta,
-        vcodec=vcodec,
-        image_writer_processes=image_writer_processes,
-        image_writer_threads=image_writer_threads,
-        parallel_encoding=parallel_encoding,
-    )
-    logger.info("LeRobot dataset written: %s", output_dir)
-    return output_dir

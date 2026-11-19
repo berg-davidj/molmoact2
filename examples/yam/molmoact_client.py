@@ -598,12 +598,21 @@ class OrchestralSessionTransport:
         )
         return dict(self.identity)
 
+    def supports_committed_actions(self) -> bool:
+        if not self.identity:
+            self.open()
+        if self._host is not None:
+            return self._host.supports_committed_actions()
+        reply = self._request({"op": "supports_committed_actions"}, timeout=self.open_timeout_sec)
+        return bool(reply["supported"])
+
     def act(
         self,
         images: Dict[str, Any],
         state: Any,
         instruction: Optional[str] = None,
         noise_seed: Optional[int] = None,
+        committed_actions: Optional[np.ndarray] = None,
     ) -> Dict[str, Any]:
         """Send one observation over the open session and return its prediction.
 
@@ -623,7 +632,8 @@ class OrchestralSessionTransport:
             raise OrchestralBridgeError(f"Orchestral observation is missing camera bytes: {missing}")
         if self._host is not None:
             return self._host.act(
-                images, state, instruction=instruction, noise_seed=noise_seed
+                images, state, instruction=instruction, noise_seed=noise_seed,
+                **({"committed_actions": committed_actions} if committed_actions is not None else {}),
             )
         header: Dict[str, Any] = {
             "op": "act",
@@ -631,6 +641,8 @@ class OrchestralSessionTransport:
             "instruction": instruction,
             "noise_seed": None if noise_seed is None else int(noise_seed),
         }
+        if committed_actions is not None:
+            header["committed_actions"] = committed_actions.tolist()
         if self.observation_encoding == "jpeg":
             header["images"] = {key: index for index, key in enumerate(CAMERA_KEYS)}
             buffers: List[Any] = [images[key] for key in CAMERA_KEYS]
@@ -949,6 +961,9 @@ class MolmoActOrchestral(PolicyBase):
         advertised = self.identity.get("action_horizon")
         return int(exec_steps or advertised or self.action_horizon)
 
+    def supports_committed_actions(self) -> bool:
+        return self._transport.supports_committed_actions()
+
     def get_action_horizon(self) -> int:
         if self.identity:
             return self._expected_action_horizon()
@@ -1127,6 +1142,12 @@ class MolmoActOrchestral(PolicyBase):
         if not np.isfinite(state).all():
             raise ValueError("MolmoActOrchestral request state contains non-finite values")
 
+        committed = input_dict.get("committed_actions")
+        if committed is not None:
+            committed = np.asarray(committed, dtype=np.float32)
+            if self._endpoint_single_arm_side is not None:
+                start = 0 if self._endpoint_single_arm_side == "left" else ARM_DIM
+                committed = committed[:, start:start + ARM_DIM]
         noise_seed, seed_metadata = self._noise_seed_for_next_query()
         act_started = time.perf_counter()
         prediction = self._transport.act(
@@ -1134,6 +1155,7 @@ class MolmoActOrchestral(PolicyBase):
             state.tolist(),
             instruction=input_dict.get("instruction"),
             noise_seed=noise_seed,
+            **({"committed_actions": committed} if committed is not None else {}),
         )
         act_ms = (time.perf_counter() - act_started) * 1000.0
         # Advance only on success, matching MolmoActLocal: a retried act must
