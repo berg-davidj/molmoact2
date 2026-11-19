@@ -236,6 +236,37 @@ executor rather than fabricating state. Shadow execution remains available
 only when requested explicitly with `--execution-mode shadow`.
 
 
+### Real-time chunking
+
+`rtc_rollout.py` drives one arm with the Orchestral SDK's `RealTimeChunking`
+(Black, Galliker, Levine 2025, [arXiv:2506.07339](https://arxiv.org/abs/2506.07339)).
+The launcher runs a chunk, then waits for the next prediction. Here the arm never waits:
+the next prediction is requested while the current chunk is still running, and the
+rows the arm runs meanwhile are sent as committed actions, which the model returns
+unchanged so the new chunk continues from them without a jump. The SDK measures the
+prediction delay and picks how many rows to commit.
+
+It needs a deployment that supports committed actions, such as the pi0.5 red-cap
+checkpoint (15 × 7 at 15 Hz); MolmoAct2 does not yet. It uses the launcher's rig
+configs, camera checks, execution mask and rest-pose return, and an Orchestral SDK
+with `orchestral.RealTimeChunking`.
+
+```bash
+PYTHONPATH=examples/yam python examples/yam/rtc_rollout.py \
+  --config-path examples/yam/configs/pi05_bimanual_physical.yaml \
+  --right-config-path examples/yam/configs/pi05_right_primary.yaml \
+  --orchestral-deployment dep_xxxxxxxxxxxx \
+  --active-arm-side left --seconds 60
+```
+
+- `--s-min` (default 7): rows of a chunk to run before the next request, so a
+  15-row chunk replans about every half second at 15 Hz.
+- `--d-init` (default 2): prediction delay in ticks assumed until one is measured.
+- The red-cap model predicts joint deltas from its query state, so committed rows
+  are re-expressed from the previous query state to the new one before they are sent.
+- A failed prediction ends the rollout (the arm holds its last target). The summary
+  logs rows sent, hold ticks, late chunks and measured delays.
+
 ### Metrics
 
 Metrics for hosted (`server` mode) deployments are in the official Grafana at

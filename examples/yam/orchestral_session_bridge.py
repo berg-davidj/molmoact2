@@ -406,11 +406,20 @@ class OrchestralSessionHost:
                              observation_encoding=self.observation_encoding)
         return dict(self.identity)
 
-    def act(self, images, state, instruction=None, noise_seed=None):
-        import numpy as np
-        from dataclasses import asdict
+    @property
+    def session(self):
+        """The open SDK ``Session`` (for callers that drive it themselves, e.g. real-time chunking)."""
         if self._session is None:
             raise OrchestralBridgeError("Orchestral session is not open")
+        return self._session
+
+    def predict_inputs(self, images, state):
+        """``Session.predict`` inputs for one observation, and the endpoint state they were built from.
+
+        Maps the rig's ``top``/``left``/``right`` frames onto the deployment's camera names and
+        applies the policy adapter's input conversion (red-cap: gripper sent as ``1 - aperture``).
+        """
+        import numpy as np
         missing = missing_cameras(images)
         if missing:
             raise OrchestralBridgeError(f"Orchestral observation is missing camera bytes: {missing}")
@@ -424,15 +433,30 @@ class OrchestralSessionHost:
         inputs["state"] = query_state.copy()
         if self.policy_adapter == "pi05_yam_red_cap":
             inputs["state"][6] = 1.0 - np.clip(query_state[6], 0.0, 1.0)
+        return inputs, query_state
+
+    def robot_actions(self, actions, query_state):
+        """Convert endpoint actions to absolute joint targets (red-cap: add the query joints, invert the gripper)."""
+        import numpy as np
+        actions = np.array(actions, dtype=np.float32, copy=True)
+        if self.policy_adapter == "pi05_yam_red_cap":
+            actions[..., :6] += np.asarray(query_state, dtype=np.float32)[:6]
+            actions[..., 6] = np.clip(1.0 - actions[..., 6], 0.0, 1.0)
+        return actions
+
+    def act(self, images, state, instruction=None, noise_seed=None):
+        import numpy as np
+        from dataclasses import asdict
+        if self._session is None:
+            raise OrchestralBridgeError("Orchestral session is not open")
+        inputs, query_state = self.predict_inputs(images, state)
         result = self._session.predict(inputs=inputs, instruction=instruction or self.instruction,
                                        episode_start=self._episode_start, noise_seed=noise_seed)
         self._episode_start = False
         actions = np.asarray(result.actions, dtype=np.float32).copy()
         if actions.shape != (self.identity["action_horizon"], self.identity["action_dim"]) or not np.isfinite(actions).all():
             raise OrchestralBridgeError("actions must be finite and match the endpoint shape")
-        if self.policy_adapter == "pi05_yam_red_cap":
-            actions[:, :6] += query_state[:6]
-            actions[:, 6] = np.clip(1.0 - actions[:, 6], 0.0, 1.0)
+        actions = self.robot_actions(actions, query_state)
         timings = asdict(result.timings)
         return {"actions": actions.tolist(), "horizon": len(actions),
                 "action_space": ACTION_SPACE,
