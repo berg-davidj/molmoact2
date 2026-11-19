@@ -7,10 +7,10 @@ orchestral_dir="$repo_dir/../orchestral"
 robot_python="${YAM_PYTHON:-$repo_dir/.venv/bin/python}"
 i2rt_dir="${I2RT_ROOT:-$repo_dir/../i2rt}"
 grant="${ORCHESTRAL_GRANT:-$orchestral_dir/.thor-pi05/grant}"
-export ORCHESTRAL_PYTHON="${ORCHESTRAL_PYTHON:-$orchestral_dir/.venv/bin/python}"
+rtc_sdk_dir="${ORCHESTRAL_RTC_SDK_ROOT:-$orchestral_dir/.thor-pi05/rtc-sdk}"
 
-if [[ ! -x "$robot_python" || ! -x "$ORCHESTRAL_PYTHON" ]]; then
-  printf '%s\n' "Set YAM_PYTHON and ORCHESTRAL_PYTHON to the robot and Orchestral interpreters." >&2
+if [[ ! -x "$robot_python" ]]; then
+  printf '%s\n' "Set YAM_PYTHON to the robot interpreter." >&2
   exit 1
 fi
 if [[ ! -s "$grant" ]]; then
@@ -19,17 +19,17 @@ if [[ ! -s "$grant" ]]; then
 fi
 
 grant="$(realpath -- "$grant")"
+if [[ -d "$rtc_sdk_dir/src/orchestral" ]]; then
+  rtc_sdk_dir="$(realpath -- "$rtc_sdk_dir")"
+  export PYTHONPATH="$rtc_sdk_dir/src${PYTHONPATH:+:$PYTHONPATH}"
+fi
 cd -- "$repo_dir"
 export PYTHONPATH="$repo_dir/examples/yam:$i2rt_dir${PYTHONPATH:+:$PYTHONPATH}"
 
-exec "$robot_python" examples/yam/launch_yaml_eval_molmoact.py \
+exec "$robot_python" examples/yam/rtc_rollout.py \
   --config-path examples/yam/configs/pi05_red_lid_conveyor_left.yaml \
   --right-config-path examples/yam/configs/yam_deployment_right.yaml \
   --active-arm-side left \
-  --policy-mode direct \
   --orchestral-grant "$grant" \
-  --observation-encoding h264 \
   --control-hz 15 \
-  --max-steps 3000 \
-  --terminal-rollout-controls \
-  --async-committed-actions "$@"
+  "$@"

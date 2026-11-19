@@ -476,11 +476,15 @@ class OrchestralSessionHost:
                 self.begin_episode()
         return True
 
-    def act(self, images, state, instruction=None, noise_seed=None, committed_actions=None):
-        import numpy as np
-        from dataclasses import asdict
+    @property
+    def session(self):
         if self._session is None:
             raise OrchestralBridgeError("Orchestral session is not open")
+        return self._session
+
+    def predict_inputs(self, images, state):
+        """Map rig cameras and state into a prediction and keep its reference pose."""
+        import numpy as np
         missing = missing_cameras(images)
         if missing:
             raise OrchestralBridgeError(f"Orchestral observation is missing camera bytes: {missing}")
@@ -494,6 +498,26 @@ class OrchestralSessionHost:
         inputs["state"] = query_state.copy()
         if self.policy_adapter == "pi05_yam_red_cap":
             inputs["state"][6] = 1.0 - np.clip(query_state[6], 0.0, 1.0)
+        return inputs, query_state
+
+    def robot_actions(self, actions, query_state):
+        """Convert policy rows to absolute robot targets."""
+        import numpy as np
+
+        actions = np.array(actions, dtype=np.float32, copy=True)
+        if actions.shape[-1:] != (self.identity["action_dim"],) or not np.isfinite(actions).all():
+            raise OrchestralBridgeError("actions must be finite and match the endpoint width")
+        if self.policy_adapter == "pi05_yam_red_cap":
+            actions[..., :6] += query_state[:6]
+            actions[..., 6] = np.clip(1.0 - actions[..., 6], 0.0, 1.0)
+        return actions
+
+    def act(self, images, state, instruction=None, noise_seed=None, committed_actions=None):
+        import numpy as np
+        from dataclasses import asdict
+        if self._session is None:
+            raise OrchestralBridgeError("Orchestral session is not open")
+        inputs, query_state = self.predict_inputs(images, state)
         prefix = None
         if committed_actions is not None:
             prefix = np.array(committed_actions, dtype=np.float32, copy=True)
@@ -515,9 +539,7 @@ class OrchestralSessionHost:
         actions = np.asarray(result.actions, dtype=np.float32).copy()
         if actions.shape != (self.identity["action_horizon"], self.identity["action_dim"]) or not np.isfinite(actions).all():
             raise OrchestralBridgeError("actions must be finite and match the endpoint shape")
-        if self.policy_adapter == "pi05_yam_red_cap":
-            actions[:, :6] += query_state[:6]
-            actions[:, 6] = np.clip(1.0 - actions[:, 6], 0.0, 1.0)
+        actions = self.robot_actions(actions, query_state)
         timings = asdict(result.timings)
         return {"actions": actions.tolist(), "horizon": len(actions),
                 "action_space": ACTION_SPACE,
