@@ -82,6 +82,48 @@ config/CLI. `configs/yam_left.yaml` ships `mode: http`; the physical-arm
 configs ship `mode: local`. Pass `--policy-mode server` to take the hosted path
 without editing a rollout YAML.
 
+### Local red-lid pi0.5 on Thor
+
+With the loopback Orchestral Worker running, start a timed RTC rollout with
+`examples/yam/run-rollout.sh`. Press Enter to start with the configured
+red-lid instruction. The script uses H.264 at 15 Hz and defaults to 60 seconds.
+Pass `--seconds 120` to extend it, or press Ctrl-C to end it early.
+
+RTC runs a single timed rollout. Use `launch_yaml_eval_molmoact.py` for
+per-object labeling, saved evaluations, and LeRobot export.
+
+The launcher imports the SDK in the robot interpreter. Install the runtime
+dependencies from `examples/yam/requirements-rtc.txt` and use an SDK build
+that exports `orchestral.RealTimeChunking`. The PyPI version pinned in that
+file provides the SDK dependencies and native client, but predates RTC.
+For a source build, Thor was verified with Orchestral commit
+`b816cdbe18b0eed247f9fd49c90222e300b7ddb1`. Prepare that checkout with
+`just install apis native`, then set `ORCHESTRAL_RTC_SDK_ROOT` to its path.
+On Thor, the wrapper defaults to the prepared
+`../orchestral/.thor-pi05/rtc-sdk` directory.
+
+Set `YAM_PYTHON`, `I2RT_ROOT`, or `ORCHESTRAL_GRANT` to use a different
+robot interpreter, i2rt checkout, or Grant file.
+
+To start a Worker separately, use an Orchestral Worker Python environment with
+OpenPI, JAX CUDA 13, cuBLAS 13.2 or newer, and the native QUIC binary. Download
+`orchestrallabs/pi05-yam-red-lid-speedaug` at revision
+`120c476d4c3e394fff976b33d2ce728b194e84eb` into a local directory and run:
+
+```bash
+/path/to/worker-python examples/yam/start_local_pi05_worker.py \
+  --checkpoint /path/to/checkpoint \
+  --grant ../orchestral/.thor-pi05/grant
+```
+
+The Worker listens on loopback, creates a private Grant after warm-up, and
+removes it on shutdown. On a provisioned Thor checkout, you can use
+`../orchestral/.thor-pi05/runtime.sh` in place of `/path/to/worker-python`.
+Set `ORCHESTRAL_THOR_DEPS` to the verified dependency directory and pass
+absolute paths for the Python script, checkpoint, and Grant. Run one Worker
+on the Thor GPU. For LeRobot conversion, install LeRobot in the robot
+interpreter or in `.venv-lerobot` at the repository root.
+
 ### Switching deployment models
 
 For ABC-VLA, MolmoAct2, and other compatible YAM joint-position policies, use
@@ -235,6 +277,36 @@ arm connected: its real feedback supplies the held half of the bimanual
 executor rather than fabricating state. Shadow execution remains available
 only when requested explicitly with `--execution-mode shadow`.
 
+
+### Real-time chunking
+
+`rtc_rollout.py` drives one arm with the Orchestral SDK's `RealTimeChunking`
+(Black, Galliker, Levine 2025, [arXiv:2506.07339](https://arxiv.org/abs/2506.07339)).
+The next prediction starts while the current chunk is running. The SDK estimates
+prediction delay and commits the rows the arm will run during that time. The next
+chunk continues after the committed rows. If the prediction misses that boundary,
+the arm holds the last target until it arrives.
+
+It needs a deployment that supports committed actions, such as the pi0.5 red-cap
+checkpoint (15 × 7 at 15 Hz); MolmoAct2 does not yet. It uses the launcher's rig
+configs, camera checks, execution mask and rest-pose return, and an Orchestral SDK
+with `orchestral.RealTimeChunking`.
+
+```bash
+PYTHONPATH=examples/yam python examples/yam/rtc_rollout.py \
+  --config-path examples/yam/configs/pi05_bimanual_physical.yaml \
+  --right-config-path examples/yam/configs/pi05_right_primary.yaml \
+  --orchestral-deployment dep_xxxxxxxxxxxx \
+  --active-arm-side left --seconds 60
+```
+
+- `--s-min` (default 7): rows of a chunk to run before the next request, so a
+  15-row chunk replans about every half second at 15 Hz.
+- `--d-init` (default 2): prediction delay in ticks assumed until one is measured.
+- The red-cap model predicts joint deltas from its query state, so committed rows
+  are re-expressed from the previous query state to the new one before they are sent.
+- A failed prediction ends the rollout (the arm holds its last target). The summary
+  logs rows sent, hold ticks, late chunks and measured delays.
 
 ### Metrics
 

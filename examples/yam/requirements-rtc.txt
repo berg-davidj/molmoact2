@@ -1,0 +1,2 @@
+# SDK dependencies and native client for the RTC source build described in README.md.
+orchestral-labs==0.2.1
