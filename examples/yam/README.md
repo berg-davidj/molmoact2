@@ -105,6 +105,12 @@ On Thor, the wrapper defaults to the prepared
 Set `YAM_PYTHON`, `I2RT_ROOT`, or `ORCHESTRAL_GRANT` to use a different
 robot interpreter, i2rt checkout, or Grant file.
 
+The Session is opened from the Worker's Grant, so it has no control-plane login. To send its
+live spans (observation-to-action, reaction, held ticks and tick jitter) to Grafana, set
+`ORC_TELEMETRY_BASE_URL` (the control plane, for example `https://api.orchestrallabs.ai`) and
+`ORC_TELEMETRY_API_KEY` (an API key of the org that should own them). This needs an Orchestral
+SDK that relays grant-only Sessions; without the two variables the spans are not sent.
+
 To start a Worker separately, use an Orchestral Worker Python environment with
 OpenPI, JAX CUDA 13, cuBLAS 13.2 or newer, and the native QUIC binary. Download
 `orchestrallabs/pi05-yam-red-lid-speedaug` at revision
