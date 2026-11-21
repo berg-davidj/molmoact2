@@ -20,6 +20,8 @@ from orchestral.core.tailnet import ManagedTailnetNode, TailscaleCli
 DEFAULT_DEPLOYMENT = "steady-ape-3roj"
 LEFT_CONFIG = "examples/yam/configs/pi05_holesaw_conveyor_left.yaml"
 RIGHT_CONFIG = "examples/yam/configs/yam_deployment_right.yaml"
+# Allow MolmoAct2 to overshoot aperture endpoints before the rollout clips to [0, 1].
+MOLMOACT2_GRIPPER_TOLERANCE = 0.15
 
 original_init = ManagedTailnetNode.__init__
 original_run = TailscaleCli.run
@@ -147,6 +149,8 @@ def rollout_joint_policy(host, identity, args):
                         shadow=args.shadow, lead_steps=args.prefetch_lead_steps,
                         camera_bindings=bindings, history_offsets=(), control_hz=args.control_hz,
                         action_shape=checked_shape,
+                        model_label="MolmoAct2" if family == "molmoact2" else "GR00T",
+                        gripper_tolerance=MOLMOACT2_GRIPPER_TOLERANCE if family == "molmoact2" else 0.05,
                     )
                 finally:
                     env.close()

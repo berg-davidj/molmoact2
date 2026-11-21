@@ -34,14 +34,20 @@ def frames_for_policy(obs, camera_shapes, camera_bindings=CAMERAS):
     return frames
 
 
-def checked_chunk(session, cameras, state, instruction, *, episode_start, action_shape=ACTION_SHAPE):
+def checked_chunk(session, cameras, state, instruction, *, episode_start, action_shape=ACTION_SHAPE,
+                  model_label="GR00T", gripper_tolerance=0.05):
     start = time.monotonic()
     response = session.predict(cameras=cameras, state=state, instruction=instruction, episode_start=episode_start)
     chunk = np.asarray(response.actions, dtype=np.float32)
     if chunk.shape != action_shape or not np.isfinite(chunk).all():
-        raise ValueError("The policy returned an invalid action chunk")
-    if np.any((chunk[:, 6] < -0.05) | (chunk[:, 6] > 1.05)):
-        raise ValueError("The policy returned a gripper target outside the normalized aperture range")
+        raise ValueError(f"{model_label} returned an invalid action chunk")
+    gripper = chunk[:, 6]
+    lower, upper = -gripper_tolerance, 1.0 + gripper_tolerance
+    if np.any((gripper < lower) | (gripper > upper)):
+        raise ValueError(
+            f"{model_label} returned gripper targets ranging from {gripper.min():.4f} to "
+            f"{gripper.max():.4f}, outside the accepted aperture range [{lower:.2f}, {upper:.2f}]"
+        )
     chunk = chunk.copy()
     chunk[:, 6] = np.clip(chunk[:, 6], 0, 1)
     return chunk, time.monotonic() - start
@@ -58,7 +64,7 @@ def warm_session(session, instruction):
 
 def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
         camera_bindings=CAMERAS, history_offsets=(-3, 0), control_hz=CONTROL_HZ,
-        action_shape=ACTION_SHAPE):
+        action_shape=ACTION_SHAPE, model_label="GR00T", gripper_tolerance=0.05):
     period = 1 / control_hz
     history_size = 1 - min(history_offsets, default=0)
     history = deque(maxlen=history_size)
@@ -69,7 +75,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
     rows = predictions = handoffs = misses = holds = 0
     next_tick = time.monotonic()
     deadline = next_tick + seconds
-    predictor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gr00t-predict")
+    predictor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"{model_label.lower()}-predict")
     try:
         while time.monotonic() < deadline:
             obs = env.get_obs()
@@ -84,7 +90,8 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 # observation instead of applying a plan computed before the hold.
                 if submitted_with and request_hold_ticks:
                     misses += 1
-                    print(f"[gr00t] Prefetch missed the boundary ({elapsed * 1000:.0f} ms). Replanning.", flush=True)
+                    print(f"[{model_label.lower()}] Prefetch missed the boundary ({elapsed * 1000:.0f} ms). "
+                          "Replanning.", flush=True)
                 else:
                     pending.extend(chunk[submitted_with:])
                     handoffs += bool(submitted_with)
@@ -98,7 +105,8 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 request_hold_ticks = 0
                 future = predictor.submit(checked_chunk, session, cameras, measured[:7].copy(),
                                           instruction, episode_start=(predictions == 0),
-                                          action_shape=action_shape)
+                                          action_shape=action_shape, model_label=model_label,
+                                          gripper_tolerance=gripper_tolerance)
                 predictions += 1
 
             next_tick += period
@@ -117,7 +125,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
             time.sleep(max(0, next_tick - time.monotonic()))
     finally:
         predictor.shutdown(wait=False, cancel_futures=True)
-    print(f"Joint-policy rollout finished. {predictions} predictions, {rows} {'shadow rows' if shadow else 'commands'}, "
+    print(f"{model_label} rollout finished. {predictions} predictions, {rows} {'shadow rows' if shadow else 'commands'}, "
           f"{handoffs} prefetched handoffs, {misses} missed boundaries, {holds} hold ticks.")
 
 
