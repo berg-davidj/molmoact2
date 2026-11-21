@@ -101,7 +101,7 @@ def rollout_joint_policy(host, identity, args):
           "Clear the workspace, then press Enter to start (Ctrl+C stops)... ")
     output_path = (
         args.rrd.expanduser().resolve() if args.rrd else
-        Path("yam_eval_runs/rerun") / f"{family}_{datetime.now().astimezone():%Y%m%d_%H%M%S}.rrd"
+        Path("yam_eval_runs/rerun") / f"{args.deployment}_{datetime.now().astimezone():%Y%m%d_%H%M%S}.rrd"
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     sensor_roles = {
