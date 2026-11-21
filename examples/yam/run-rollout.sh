@@ -18,6 +18,9 @@ if [[ ! -s "$grant" ]]; then
   exit 1
 fi
 
+if [[ -z "${ORC_TELEMETRY_BASE_URL:-}" || -z "${ORC_TELEMETRY_API_KEY:-}" ]]; then
+  printf '%s\n' "ORC_TELEMETRY_BASE_URL and ORC_TELEMETRY_API_KEY are not both set: the Session's control-loop spans stay on this machine." >&2
+fi
 grant="$(realpath -- "$grant")"
 if [[ -d "$rtc_sdk_dir/src/orchestral" ]]; then
   rtc_sdk_dir="$(realpath -- "$rtc_sdk_dir")"
