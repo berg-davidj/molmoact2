@@ -706,7 +706,7 @@ cli = [
 [[package]]
 name = "i2rt"
 version = "1.1.2"
-source = { git = "https://github.com/npow/i2rt.git?rev=codex%2Fyam-reliability-checkpoint#6e91100a9132b0b1888460c3163c160c6ab4c335" }
+source = { git = "https://github.com/npow/i2rt.git?rev=codex%2Fyam-reliability-checkpoint#9d5cb2f51b502c91d84485bf11a29c15e7127b39" }
 dependencies = [
     { name = "click" },
     { name = "crcmod-plus" },
