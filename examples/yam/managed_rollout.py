@@ -167,7 +167,7 @@ def rollout_joint_policy(host, identity, args):
     print(f"[rerun] Recording every captured camera frame to {output_path}", flush=True)
     try:
         with recording:
-            recording.save(output_path, default_blueprint=rollout["record_blueprint"](bindings))
+            recording.save(output_path, default_blueprint=rollout["record_blueprint"](bindings, control_trace=True))
             recording.log(
                 "/task/instruction",
                 rr.TextDocument(f"# Task instruction\n\n{args.instruction}", media_type="text/markdown"),
@@ -196,6 +196,7 @@ def rollout_joint_policy(host, identity, args):
                         timestamp_observations=family == "verne", max_plan_rows=plan_rows,
                         temporal_history=temporal_history,
                         gripper_tolerance=MOLMOACT2_GRIPPER_TOLERANCE if family == "molmoact2" else 0.05,
+                        trace=rollout["RolloutTrace"](recording, recording_start, host.session),
                     )
                 finally:
                     env.close()

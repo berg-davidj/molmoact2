@@ -36,7 +36,7 @@ def frames_for_policy(obs, camera_shapes, camera_bindings=CAMERAS):
 
 def checked_chunk(session, cameras, state, instruction, *, episode_start, action_shape=ACTION_SHAPE,
                   model_label="GR00T", gripper_tolerance=0.05, pose_actions=None, matrix_policy=False,
-                  observation_time=None, max_plan_rows=None, history_inputs=None):
+                  observation_time=None, max_plan_rows=None, history_inputs=None, trace=None, prediction_id=0):
     start = time.monotonic()
     query_state = pose_actions.state(state, matrix_policy=matrix_policy) if pose_actions else state
     sensors = {} if observation_time is None else {"timestamp": np.array([observation_time], dtype=np.float64)}
@@ -46,6 +46,8 @@ def checked_chunk(session, cameras, state, instruction, *, episode_start, action
     response = session.predict(cameras=cameras, state=query_state, instruction=instruction,
                                episode_start=episode_start, **sensors)
     chunk = np.asarray(response.actions, dtype=np.float32)
+    if trace is not None:
+        trace.prediction(prediction_id, response, chunk, session, time.monotonic() - start)
     if chunk.shape != action_shape or not np.isfinite(chunk).all():
         raise ValueError(f"{model_label} returned an invalid action chunk")
     chunk = chunk[:max_plan_rows]
@@ -81,12 +83,13 @@ def warm_session(session, instruction):
 def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
         camera_bindings=CAMERAS, history_offsets=(-3, 0), control_hz=CONTROL_HZ,
         action_shape=ACTION_SHAPE, model_label="GR00T", gripper_tolerance=0.05, pose_actions=None, matrix_policy=False,
-        timestamp_observations=False, max_plan_rows=None, temporal_history=None):
+        timestamp_observations=False, max_plan_rows=None, temporal_history=None, trace=None):
     period = 1 / control_hz
     history_size = 1 - min(history_offsets, default=0)
     history = deque(maxlen=history_size)
     pending = deque()
     future = None
+    active_prediction = 0
     submitted_with = 0
     request_hold_ticks = 0
     rejected_chunks = 0
@@ -105,8 +108,20 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
             if temporal_history is not None:
                 temporal_history.observe(frames, measured[:7])
             if not pending and future is not None and future.done():
-                chunk, elapsed = future.result()
+                try:
+                    chunk, elapsed = future.result()
+                except Exception as error:
+                    if trace is not None:
+                        trace.event(f"Prediction {predictions} failed: {error}")
+                    raise
                 future = None
+                if trace is not None:
+                    if not len(chunk):
+                        trace.event(f"Prediction {predictions} rejected: unreachable plan")
+                    elif submitted_with and request_hold_ticks:
+                        trace.event(f"Prediction {predictions} dropped after {request_hold_ticks} hold ticks")
+                    else:
+                        trace.event(f"Prediction {predictions} accepted starting at row {submitted_with}")
                 if len(chunk):
                     rejected_chunks = 0
                 else:
@@ -122,7 +137,8 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                     print(f"[{model_label.lower()}] Prefetch missed the boundary ({elapsed * 1000:.0f} ms). "
                           "Replanning.", flush=True)
                 else:
-                    pending.extend(chunk[submitted_with:])
+                    pending.extend(enumerate(chunk[submitted_with:], start=submitted_with))
+                    active_prediction = predictions
                     handoffs += bool(submitted_with)
             if len(history) == history_size and future is None and len(pending) <= lead_steps:
                 cameras = (
@@ -135,17 +151,21 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                     cameras, history_inputs = temporal_history.inputs()
                 submitted_with = len(pending)
                 request_hold_ticks = 0
+                if trace is not None:
+                    trace.event(f"Prediction {predictions + 1} requested with {submitted_with} queued rows")
                 future = predictor.submit(checked_chunk, session, cameras, measured[:7].copy(),
                                           instruction, episode_start=(predictions == 0),
                                           action_shape=action_shape, model_label=model_label,
                                           gripper_tolerance=gripper_tolerance, pose_actions=pose_actions,
                                           matrix_policy=matrix_policy, observation_time=observation_time,
-                                          max_plan_rows=max_plan_rows, history_inputs=history_inputs)
+                                          max_plan_rows=max_plan_rows, history_inputs=history_inputs,
+                                          trace=trace, prediction_id=predictions + 1)
                 predictions += 1
 
             next_tick += period
+            row = command = row_index = None
             if pending and time.monotonic() < deadline:
-                row = pending.popleft()
+                row_index, row = pending.popleft()
                 if not shadow:
                     measured = mask.validate_state(env.get_robot_state()["joint_positions"], name="measured state")
                     target = measured.copy()
@@ -159,8 +179,13 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
             elif future is not None:
                 request_hold_ticks += 1
                 holds += 1
+            if trace is not None:
+                trace.tick(measured, row, command, active_prediction, row_index,
+                           holding=row is None and future is not None)
             time.sleep(max(0, next_tick - time.monotonic()))
     finally:
+        if trace is not None:
+            trace.stop()
         predictor.shutdown(wait=False, cancel_futures=True)
     print(f"{model_label} rollout finished. {predictions} predictions, {rows} {'shadow rows' if shadow else 'commands'}, "
           f"{handoffs} prefetched handoffs, {misses} missed boundaries, {holds} hold ticks.")
@@ -190,12 +215,82 @@ def record_camera_frame(recording, camera_paths, frame_counts, count_lock, start
         frame_counts[model_camera] += 1
 
 
-def record_blueprint(camera_bindings):
+class RolloutTrace:
+    """Record policy responses and control ticks on the camera timeline."""
+
+    def __init__(self, recording, start_time, session):
+        self.recording = recording
+        self.start_time = start_time
+        self._response_lock = threading.Lock()
+        self._stopped = False
+        names = [f"{arm} joint {joint}" if joint < 7 else f"{arm} aperture"
+                 for arm in ("left", "right") for joint in range(1, 8)]
+        for path in ("measured", "command_sent"):
+            recording.log(f"/robot/{path}", rr.SeriesLines(names=names), static=True)
+        recording.log("/robot/planned_left", rr.SeriesLines(names=names[:7]), static=True)
+        encoder = getattr(session, "encoder_label", None) or getattr(session, "encoder", "unknown")
+        recording.log("/policy/encoder", rr.TextDocument(str(encoder)), static=True)
+
+    def _set_time(self):
+        self.recording.set_time("elapsed", duration=time.monotonic() - self.start_time)
+
+    def prediction(self, prediction_id, response, chunk, session, elapsed):
+        with self._response_lock:
+            if self._stopped:
+                return
+            self._set_time()
+            self.recording.log("/policy/latency/client_ms", rr.Scalars(elapsed * 1000))
+            timings = getattr(response, "timings", None)
+            for field, label in (("accel_exec_us", "model_ms"), ("net_wire_us", "network_ms"),
+                                 ("encode_us", "encode_ms")):
+                duration = getattr(timings, field, None)
+                if duration is not None:
+                    self.recording.log(f"/policy/latency/{label}", rr.Scalars(duration / 1000))
+            sizes = getattr(session, "payload_sizes", None)
+            if sizes and (request_bytes := sizes[-1].get("request_bytes")) is not None:
+                self.recording.log("/policy/upload/request_bytes", rr.Scalars(request_bytes))
+            if chunk.ndim == 2 and chunk.size:
+                self.recording.log("/policy/raw_actions", rr.Tensor(chunk, dim_names=["row", "action"]),
+                                   rr.AnyValues(prediction_id=prediction_id))
+            self.recording.log("/policy/events", rr.TextLog(f"Prediction {prediction_id} received"))
+
+    def event(self, message):
+        self._set_time()
+        self.recording.log("/policy/events", rr.TextLog(message))
+
+    def tick(self, measured, row, command, prediction_id, row_index, *, holding):
+        self._set_time()
+        self.recording.log("/robot/measured", rr.Scalars(measured))
+        self.recording.log("/policy/holding", rr.Scalars(int(holding)))
+        if row is not None:
+            self.recording.log("/robot/planned_left", rr.Scalars(row),
+                               rr.AnyValues(prediction_id=prediction_id, row_index=row_index))
+        if command is not None:
+            self.recording.log("/robot/command_sent", rr.Scalars(command),
+                               rr.AnyValues(prediction_id=prediction_id, row_index=row_index))
+
+    def stop(self):
+        with self._response_lock:
+            self._stopped = True
+
+
+def record_blueprint(camera_bindings, *, control_trace=False):
     views = [
         rrb.Spatial2DView(origin=f"/cameras/{name}", name=f"{name} camera")
         for name in camera_bindings
     ]
-    return rrb.Blueprint(rrb.Horizontal(*views, column_shares=[1] * len(views)))
+    cameras = rrb.Horizontal(*views, column_shares=[1] * len(views))
+    if not control_trace:
+        return rrb.Blueprint(cameras)
+    telemetry = rrb.Tabs(
+        rrb.TimeSeriesView(origin="/robot", name="Measured and commanded joints"),
+        rrb.TimeSeriesView(origin="/policy/latency", name="Inference latency (ms)"),
+        rrb.TimeSeriesView(origin="/policy/upload", name="Request size (bytes)"),
+        rrb.TimeSeriesView(origin="/policy/holding", name="Hold ticks"),
+        rrb.TensorView(origin="/policy/raw_actions", name="Raw action chunk"),
+        rrb.TextLogView(origin="/policy/events", name="Chunk events"),
+    )
+    return rrb.Blueprint(rrb.Vertical(cameras, telemetry, row_shares=[3, 2]))
 
 
 def main():
@@ -257,7 +352,7 @@ def main():
         recording_start = time.monotonic()
         try:
             with recording:
-                recording.save(output_path, default_blueprint=record_blueprint(CAMERAS))
+                recording.save(output_path, default_blueprint=record_blueprint(CAMERAS, control_trace=True))
                 recording.log(
                     "/task/instruction",
                     rr.TextDocument(f"# Task instruction\n\n{args.instruction}", media_type="text/markdown"),
@@ -274,7 +369,8 @@ def main():
                 )
                 try:
                     run(env, session, mask, seconds=args.seconds, instruction=args.instruction, shadow=args.shadow,
-                        lead_steps=args.prefetch_lead_steps)
+                        lead_steps=args.prefetch_lead_steps,
+                        trace=RolloutTrace(recording, recording_start, session))
                 finally:
                     env.close()
         finally:
