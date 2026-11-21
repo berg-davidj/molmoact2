@@ -132,7 +132,10 @@ def rollout_joint_policy(host, identity, args):
     mask = resolve_bimanual_execution_mask(
         bimanual=True, active_arm_side="left",
         execution_mode="shadow" if args.shadow else "active_arm_hold",
-        both_arm_max_delta=([0.05] * 6 + [0.025]) * 2,
+        # Per-tick cap against encoder feedback, sized from the Holesaw demos at 15 Hz:
+        # joints reach 0.19 rad/step at p99, the gripper up to 0.67/step when closing.
+        # A tighter gripper cap stops the jaws at the object and leaves no grip force.
+        both_arm_max_delta=([0.2] * 6 + [1.0]) * 2,
     )
     rig_cameras = {"top": "front_camera", "left": "left_camera", "right": "right_camera"}
     camera_mapping = identity["camera_mapping"]
@@ -483,7 +486,8 @@ def main():
 
     settings = argparse.ArgumentParser(prog=parser.prog)
     settings.add_argument("--seconds", type=float, default=300)
-    settings.add_argument("--control-hz", type=float, default=15 if family in {"praxis1", "isaac05", "flux3-action"} else 30)
+    # Every YAM checkpoint is trained on 15 Hz data, so each action is one 15 Hz step.
+    settings.add_argument("--control-hz", type=float, default=15)
     settings.add_argument("--instruction", default=OmegaConf.load(LEFT_CONFIG).storage.language_instruction)
     settings.add_argument("--prefetch-lead-steps", type=int, default=0 if family in {"verne", "flux3-action"} else 8)
     settings.add_argument("--shadow", action="store_true")

@@ -7,7 +7,6 @@ repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 orchestral_dir="$repo_dir/../orchestral"
 robot_python="${YAM_PYTHON:-$repo_dir/.venv/bin/python}"
 i2rt_dir="${I2RT_ROOT:-$repo_dir/../i2rt}"
-default_grant="$orchestral_dir/.thor-pi05/grant"
 rtc_config=examples/yam/configs/pi05_red_lid_conveyor_left.yaml
 rtc_sdk_dir="${ORCHESTRAL_RTC_SDK_ROOT:-}"
 
@@ -51,16 +50,9 @@ if [[ -n "$rtc_sdk_dir" && -d "$rtc_sdk_dir/src/orchestral" ]]; then
   export PYTHONPATH="$rtc_sdk_dir/src${PYTHONPATH:+:$PYTHONPATH}"
 fi
 
+# The model is read from the Worker grant (policy_family.py); --gr00t is accepted but not needed.
 if [[ "${1:-}" == "--gr00t" ]]; then
   shift
-  gr00t_dir="$orchestral_dir/.thor-gr00t"
-  export PYTHONPATH="$repo_dir/examples/yam:$i2rt_dir${PYTHONPATH:+:$PYTHONPATH}"
-  cd -- "$repo_dir"
-  exec "$robot_python" "$gr00t_dir/rollout.py" \
-    --config-path examples/yam/configs/pi05_red_lid_conveyor_left.yaml \
-    --right-config-path examples/yam/configs/yam_deployment_right.yaml \
-    --orchestral-grant "${ORCHESTRAL_GRANT:-$gr00t_dir/grant}" \
-    "$@"
 fi
 
 use_predictive=0
@@ -98,16 +90,43 @@ if [[ "$use_predictive" -eq 1 ]]; then
     "${pass_args[@]}"
 fi
 
+holesaw=0
 if [[ "${pass_args[0]:-}" == "--holesaw" ]]; then
-  rtc_config=examples/yam/configs/pi05_holesaw_conveyor_left.yaml
-  default_grant="$orchestral_dir/.thor-pi05/grant-holesaw"
+  holesaw=1
   pass_args=("${pass_args[@]:1}")
 fi
-grant="${ORCHESTRAL_GRANT:-$default_grant}"
 
-if [[ ! -s "$grant" ]]; then
-  printf 'Local Worker Grant missing at %s. Start the Worker or set ORCHESTRAL_GRANT (or pass --predictive).\n' "$grant" >&2
+# Use ORCHESTRAL_GRANT if set; otherwise the one live grant among the local Workers'.
+if [[ -n "${ORCHESTRAL_GRANT:-}" ]]; then
+  candidates=("$ORCHESTRAL_GRANT")
+else
+  candidates=(
+    "$orchestral_dir/.thor-pi05/grant-holesaw"
+    "$orchestral_dir/.thor-pi05/grant"
+    "$orchestral_dir/.thor-gr00t/grant"
+  )
+fi
+if ! detected="$("$robot_python" examples/yam/policy_family.py "${candidates[@]}")"; then
+  printf '%s\n' "(or pass --predictive for the vision-only controller)" >&2
   exit 1
+fi
+family="${detected%% *}"
+grant="${detected#* }"
+printf 'Detected %s Worker from %s\n' "$family" "$grant" >&2
+
+if [[ "$family" == "gr00t" ]]; then
+  exec "$robot_python" "$orchestral_dir/.thor-gr00t/rollout.py" \
+    --config-path examples/yam/configs/pi05_red_lid_conveyor_left.yaml \
+    --right-config-path examples/yam/configs/yam_deployment_right.yaml \
+    --orchestral-grant "$grant" \
+    ${pass_args[@]+"${pass_args[@]}"}
+fi
+if [[ "$family" != "pi05" ]]; then
+  printf 'No local rollout for %s Workers; serve it as a deployment and pass --deployment.\n' "$family" >&2
+  exit 1
+fi
+if [[ "$holesaw" -eq 1 || "$(basename -- "$grant")" == grant-holesaw ]]; then
+  rtc_config=examples/yam/configs/pi05_holesaw_conveyor_left.yaml
 fi
 
 if [[ -z "${ORC_TELEMETRY_BASE_URL:-}" || -z "${ORC_TELEMETRY_API_KEY:-}" ]]; then

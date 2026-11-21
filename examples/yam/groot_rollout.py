@@ -19,7 +19,7 @@ import rerun.blueprint as rrb
 from launch_yaml_eval_molmoact import _build_env, resolve_bimanual_execution_mask, validate_bimanual_model_arm_order
 
 CAMERAS = {"belt": "front_camera_rgb", "wrist": "left_camera_rgb"}
-CONTROL_HZ = 30
+CONTROL_HZ = 15  # training rate of the YAM checkpoints; one action per 15 Hz step
 ACTION_SHAPE = (16, 7)
 
 
