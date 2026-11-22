@@ -71,6 +71,7 @@ class V4L2Camera:
         self._latest_rgb: Optional[np.ndarray] = None
         self._latest_depth: Optional[np.ndarray] = None
         self._latest_frame_timestamp: Optional[float] = None
+        self._latest_frame_monotonic: Optional[float] = None
         self._last_capture_error: Optional[BaseException] = None
 
         self._capture_thread = threading.Thread(
@@ -99,6 +100,7 @@ class V4L2Camera:
                     self._latest_rgb = rgb
                     self._latest_depth = np.zeros((*rgb.shape[:2], 1), dtype=np.uint16)
                     self._latest_frame_timestamp = time.time()
+                    self._latest_frame_monotonic = captured_at
                     self._last_capture_error = None
                     self._frame_ready.set()
                 if self._frame_callback is not None:
@@ -129,16 +131,20 @@ class V4L2Camera:
                 self._stop_event.wait(remaining)
 
     def read(self, img_size: Optional[Tuple[int, int]] = None):
-        """The cached frame as ``(rgb, depth)``; see ``read_with_timestamp``."""
-        rgb, depth, _timestamp = self.read_with_timestamp(img_size)
+        """The cached frame as ``(rgb, depth)``; see ``read_with_capture_time``."""
+        rgb, depth, _timestamp, _monotonic = self.read_with_capture_time(img_size)
         return rgb, depth
 
-    def read_with_timestamp(self, img_size: Optional[Tuple[int, int]] = None):
+    def read_with_capture_time(self, img_size: Optional[Tuple[int, int]] = None):
         """Return a cached frame immediately after the initial capture, with its capture time.
 
-        Returns ``(rgb, depth, timestamp)``; ``timestamp`` is the ``time.time()`` at which the
-        capture thread stored this frame, taken under the same lock as the frame, so it
-        belongs to the frame returned even when other threads read the camera too.
+        Returns ``(rgb, depth, timestamp, monotonic)``, the times at which the capture thread
+        stored this frame, taken under the same lock as the frame, so they belong to the frame
+        returned even when other threads read the camera too.
+
+        The capture time comes in two clocks: ``timestamp`` (``time.time()``, for staleness
+        checks) and ``monotonic`` (``time.monotonic()``, read at the same moment, for latencies:
+        it never steps).
 
         At most one initial call waits for a camera frame.  Subsequent calls
         do not wait for a new image, which lets the robot command loop remain
@@ -151,6 +157,7 @@ class V4L2Camera:
             rgb = self._latest_rgb
             depth = self._latest_depth
             timestamp = self._latest_frame_timestamp
+            monotonic = self._latest_frame_monotonic
             last_error = self._last_capture_error
 
         if rgb is None or depth is None or timestamp is None:
@@ -170,7 +177,7 @@ class V4L2Camera:
             depth = cv2.resize(depth, img_size)
             if depth.ndim == 2:
                 depth = depth[:, :, None]
-        return rgb, depth, timestamp
+        return rgb, depth, timestamp, monotonic
 
     def close(self) -> None:
         self._stop_event.set()

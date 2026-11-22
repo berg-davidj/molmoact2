@@ -33,9 +33,10 @@ class RobotEnv:
         # instead of opening RealSense devices in-process. camera_dict is
         # then ignored. See gello/cameras/camera_client.py.
         self._camera_client = camera_client
-        # Capture time (time.time()) per camera of the frames the last get_obs() returned.
-        # Empty when a camera does not report one.
-        self.last_frame_timestamps: Dict[str, float] = {}
+        # Capture time per camera of the frames the last get_obs() returned, on time.time()
+        # and on time.monotonic(); None for a camera that reported none (frame_capture_time.py).
+        self.last_frame_timestamps: Dict[str, Optional[float]] = {}
+        self.last_frame_monotonic: Dict[str, Optional[float]] = {}
 
     # dynamic offset is used in data collection to make sure the same
     # starting position between each episode.
@@ -120,26 +121,31 @@ class RobotEnv:
             obs: observation from the environment.
         """
         observations: Dict[str, Any] = {}
-        timestamps: Dict[str, float] = {}
+        timestamps: Dict[str, Optional[float]] = {}
+        monotonic: Dict[str, Optional[float]] = {}
         if self._camera_client is not None:
             frames = self._camera_client.get_obs()
+            served = getattr(self._camera_client, "last_timestamps", None) or {}
+            served_monotonic = getattr(self._camera_client, "last_monotonic", None) or {}
             for name, image in frames.items():
                 observations[f"{name}_rgb"] = image
-            timestamps = dict(getattr(self._camera_client, "last_timestamps", None) or {})
+                timestamps[name] = served.get(name)
+                monotonic[name] = served_monotonic.get(name)
         else:
             for name, camera in self._camera_dict.items():
                 # Other threads (previews, recorders) read the same cameras, so the capture
                 # time has to come back with the frame, not from a shared attribute.
-                read_with_timestamp = getattr(camera, "read_with_timestamp", None)
-                if read_with_timestamp is not None:
-                    image, _depth, timestamp = read_with_timestamp()
+                read_with_capture_time = getattr(camera, "read_with_capture_time", None)
+                if read_with_capture_time is not None:
+                    image, _depth, timestamp, mono = read_with_capture_time()
                 else:
                     image, _depth = camera.read()
-                    timestamp = None
+                    timestamp = mono = None
                 observations[f"{name}_rgb"] = image
-                if timestamp:
-                    timestamps[name] = float(timestamp)
+                timestamps[name] = float(timestamp) if timestamp else None
+                monotonic[name] = float(mono) if mono else None
         self.last_frame_timestamps = timestamps
+        self.last_frame_monotonic = monotonic
 
         observations.update(self.get_robot_state())
         return observations
