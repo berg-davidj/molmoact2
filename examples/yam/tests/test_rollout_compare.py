@@ -169,6 +169,9 @@ def test_recordings_written_by_the_rollout_trace_are_ranked(tmp_path, monkeypatc
     shadow = tmp_path / "pi05-test_20261129_100000.rrd"
     shadow.write_bytes(b"")
     record_settings(shadow, {"deployment": "pi05-test", "chunk_fusion": "ensemble", "execution_mode": "shadow"})
+    unknown = tmp_path / "pi05-test_20261128_100000.rrd"  # recorded before settings were saved
+    unknown.write_bytes(b"")
+    main(["--dir", str(tmp_path), "score", str(unknown), "--placed", "3"])
     capsys.readouterr()
     main(["--dir", str(tmp_path), "--runs"])
     out = capsys.readouterr().out
@@ -185,7 +188,7 @@ def test_recordings_written_by_the_rollout_trace_are_ranked(tmp_path, monkeypatc
     assert rail["age"] == "229ms"  # rows 0..7 of each chunk run 0..7 ticks after its observation
     assert float(rail["shift"]) == pytest.approx(0.01) and float(splice["shift"]) == 0
     assert rail["grasps"] == "0.0" and rail["time"] == "-"
-    assert "Best so far: chunk_fusion=rail" in out and "1 shadow runs" in out
+    assert "Best so far: chunk_fusion=rail" in out and "1 shadow runs" in out and "1 runs with no saved settings" in out
     assert json.loads(rollout_compare.sidecar_path(shadow).read_text())["settings"]["execution_mode"] == "shadow"
 
 

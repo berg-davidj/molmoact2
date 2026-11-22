@@ -360,10 +360,14 @@ def compare(args):
                       if datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d") >= args.since]
     runs = [load_run(path) for path in recordings]
     by_deployment = {}
-    skipped = {"shadow": 0, "no trace": 0}
+    skipped = {"shadow": 0, "no trace": 0, "no settings": 0}
     for run in runs:
         if run["shadow"]:
             skipped["shadow"] += 1
+        elif not any(key in run["settings"] for key in TUNABLE):
+            # Recorded before settings were saved: what it ran with is unknown, so it cannot
+            # be placed in a combination until `score RUN --set name=value` says.
+            skipped["no settings"] += 1
         elif run["measures"] is None and run["success"] is None:
             skipped["no trace"] += 1
         else:
@@ -375,7 +379,8 @@ def compare(args):
     print("\n\n".join(render(name, members) for name, members in sorted(selected.items())))
     if any(skipped.values()):
         print(f"\nLeft out: {skipped['shadow']} shadow runs (the arm does not move), "
-              f"{skipped['no trace']} recordings with no control trace and no score.")
+              f"{skipped['no trace']} recordings with no control trace and no score, "
+              f"{skipped['no settings']} runs with no saved settings (add them with `score RUN --set name=value`).")
     if args.runs:
         print()
         for members in selected.values():
