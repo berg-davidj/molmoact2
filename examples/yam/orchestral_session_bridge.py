@@ -283,6 +283,13 @@ def _checkpoint_input_names(
         return cameras, "state"
     if policy_adapter == TOOL_POSE_MATRIX_ADAPTER and set(images) == {"exterior", "wrist"} and len(states) == 1:
         return {"top": "exterior", "left": "wrist"}, states[0]
+    # This rig's GR00T hole-saw layout: ``top_left`` is the overhead (middle)
+    # camera, confirmed by the operator. Only this exact trio is accepted, so
+    # ``top_left`` beside any other set of views is still refused as ambiguous.
+    terminals = {re.split(r"[./]", name)[-1].lower(): name for name in images}
+    if len(images) == 3 and set(terminals) == {"top_left", "wrist_left", "wrist_right"} and len(states) == 1:
+        return {"top": terminals["top_left"], "left": terminals["wrist_left"],
+                "right": terminals["wrist_right"]}, states[0]
     cameras: Dict[str, str] = {}
     for key in CAMERA_KEYS:
         matches = [name for name in images if _camera_role(name, policy_adapter) == key]
