@@ -36,9 +36,14 @@ def frames_for_policy(obs, camera_shapes, camera_bindings=CAMERAS):
 
 def checked_chunk(session, cameras, state, instruction, *, episode_start, action_shape=ACTION_SHAPE,
                   model_label="GR00T", gripper_tolerance=0.05, pose_actions=None, matrix_policy=False,
-                  observation_time=None, max_plan_rows=None, history_inputs=None, trace=None, prediction_id=0):
+                  observation_time=None, max_plan_rows=None, history_inputs=None, trace=None, prediction_id=0,
+                  state_padding=None):
     start = time.monotonic()
     query_state = pose_actions.state(state, matrix_policy=matrix_policy) if pose_actions else state
+    if state_padding is not None:
+        # A bimanual checkpoint driving one arm: the other arm's channels are the constant
+        # the checkpoint was trained with, and only this arm's action columns are used.
+        query_state = np.concatenate([query_state, state_padding]).astype(np.float32)
     sensors = {} if observation_time is None else {"timestamp": np.array([observation_time], dtype=np.float64)}
     if history_inputs is not None:
         sensors.update(history_inputs)
@@ -51,6 +56,8 @@ def checked_chunk(session, cameras, state, instruction, *, episode_start, action
     if chunk.shape != action_shape or not np.isfinite(chunk).all():
         raise ValueError(f"{model_label} returned an invalid action chunk")
     chunk = chunk[:max_plan_rows]
+    if state_padding is not None:
+        chunk = chunk[:, :len(state)]
     if pose_actions:
         from tool_pose_actions import UnreachableToolPose
 
@@ -83,7 +90,8 @@ def warm_session(session, instruction):
 def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
         camera_bindings=CAMERAS, history_offsets=(-3, 0), control_hz=CONTROL_HZ,
         action_shape=ACTION_SHAPE, model_label="GR00T", gripper_tolerance=0.05, pose_actions=None, matrix_policy=False,
-        timestamp_observations=False, max_plan_rows=None, temporal_history=None, trace=None):
+        timestamp_observations=False, max_plan_rows=None, temporal_history=None, trace=None,
+        state_padding=None):
     period = 1 / control_hz
     history_size = 1 - min(history_offsets, default=0)
     history = deque(maxlen=history_size)
@@ -159,7 +167,8 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                                           gripper_tolerance=gripper_tolerance, pose_actions=pose_actions,
                                           matrix_policy=matrix_policy, observation_time=observation_time,
                                           max_plan_rows=max_plan_rows, history_inputs=history_inputs,
-                                          trace=trace, prediction_id=predictions + 1)
+                                          trace=trace, prediction_id=predictions + 1,
+                                          state_padding=state_padding)
                 predictions += 1
 
             next_tick += period

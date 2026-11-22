@@ -22,6 +22,12 @@ LEFT_CONFIG = "examples/yam/configs/pi05_holesaw_conveyor_left.yaml"
 RIGHT_CONFIG = "examples/yam/configs/yam_deployment_right.yaml"
 # Allow MolmoAct2 to overshoot aperture endpoints before the rollout clips to [0, 1].
 MOLMOACT2_GRIPPER_TOLERANCE = 0.15
+# Isaac 0.5 YAM checkpoints keep the release's bimanual layout: left arm in channels 0-6,
+# right arm in 7-13. The Holesaw fine-tune saw the parked right arm as this constant
+# (joints 0, gripper open), so the rollout sends exactly it and uses only the left columns.
+ISAAC_PARKED_RIGHT_ARM = np.array([0, 0, 0, 0, 0, 0, 1], dtype=np.float32)
+ISAAC_BIMANUAL_CONTROL_HZ = 30  # the release checkpoint's rate; one action per 30 Hz step
+ISAAC_BIMANUAL_PLAN_ROWS = 30   # replan every second instead of running the full 2 s chunk
 
 original_init = ManagedTailnetNode.__init__
 original_run = TailscaleCli.run
@@ -106,10 +112,16 @@ def rollout_joint_policy(host, identity, args):
     rollout = runpy.run_path(str(Path(__file__).with_name("groot_rollout.py")))
     family = args.policy_family
     checked_shape = (identity["action_horizon"], identity["action_dim"])
-    state_width, action_width = {"praxis1": (8, 13), "verne": (7, 10)}.get(family, (7, 7))
+    bimanual_layout = family == "isaac05" and (identity["state_dim"], checked_shape[1]) == (14, 14)
+    state_width, action_width = {"praxis1": (8, 13), "verne": (7, 10)}.get(
+        family, (14, 14) if bimanual_layout else (7, 7))
     if identity["state_dim"] != state_width or checked_shape[1] != action_width or checked_shape[0] <= 0:
         raise SystemExit(f"Unexpected {family} contract for YAM: {checked_shape}")
+    if args.control_hz is None:
+        args.control_hz = ISAAC_BIMANUAL_CONTROL_HZ if bimanual_layout else 15
     plan_rows = 4 if family == "verne" else checked_shape[0]
+    if bimanual_layout:
+        plan_rows = min(plan_rows, ISAAC_BIMANUAL_PLAN_ROWS)
     if args.prefetch_lead_steps >= plan_rows:
         raise SystemExit(f"--prefetch-lead-steps must be below the rollout plan length ({plan_rows})")
     temporal_history = None
@@ -135,7 +147,8 @@ def rollout_joint_policy(host, identity, args):
         # Per-tick cap against encoder feedback, sized from the Holesaw demos at 15 Hz:
         # joints reach 0.19 rad/step at p99, the gripper up to 0.67/step when closing.
         # A tighter gripper cap stops the jaws at the object and leaves no grip force.
-        both_arm_max_delta=([0.2] * 6 + [1.0]) * 2,
+        # The joint cap is a speed limit, so it shrinks with the tick when the rate rises.
+        both_arm_max_delta=([0.2 * 15 / args.control_hz] * 6 + [1.0]) * 2,
     )
     rig_cameras = {"top": "front_camera", "left": "left_camera", "right": "right_camera"}
     camera_mapping = identity["camera_mapping"]
@@ -193,8 +206,10 @@ def rollout_joint_policy(host, identity, args):
                         camera_bindings=bindings, history_offsets=(), control_hz=args.control_hz,
                         action_shape=checked_shape,
                         model_label=family, pose_actions=pose_actions, matrix_policy=family == "praxis1",
-                        timestamp_observations=family == "verne", max_plan_rows=plan_rows,
+                        # Isaac is conditioned on time since the episode began.
+                        timestamp_observations=family in {"verne", "isaac05"}, max_plan_rows=plan_rows,
                         temporal_history=temporal_history,
+                        state_padding=ISAAC_PARKED_RIGHT_ARM if bimanual_layout else None,
                         gripper_tolerance=MOLMOACT2_GRIPPER_TOLERANCE if family == "molmoact2" else 0.05,
                         trace=rollout["RolloutTrace"](recording, recording_start, host.session),
                     )
@@ -487,8 +502,9 @@ def main():
 
     settings = argparse.ArgumentParser(prog=parser.prog)
     settings.add_argument("--seconds", type=float, default=300)
-    # Every YAM checkpoint is trained on 15 Hz data, so each action is one 15 Hz step.
-    settings.add_argument("--control-hz", type=float, default=15)
+    # One action per control step: 15 Hz for the checkpoints trained on 15 Hz data, 30 Hz for
+    # an Isaac 0.5 checkpoint in the release's bimanual layout.
+    settings.add_argument("--control-hz", type=float)
     settings.add_argument("--instruction", default=OmegaConf.load(LEFT_CONFIG).storage.language_instruction)
     settings.add_argument("--prefetch-lead-steps", type=int, default=0 if family in {"verne", "flux3-action"} else 8)
     settings.add_argument("--shadow", action="store_true")
@@ -500,7 +516,7 @@ def main():
     args.policy_family = family
     if not math.isfinite(args.seconds) or args.seconds <= 0:
         settings.error("--seconds must be positive and finite")
-    if not math.isfinite(args.control_hz) or args.control_hz < 1:
+    if args.control_hz is not None and (not math.isfinite(args.control_hz) or args.control_hz < 1):
         settings.error("--control-hz must be finite and at least 1")
     if not math.isfinite(args.soak_hours) or args.soak_hours < 0:
         settings.error("--soak-hours must be finite and nonnegative")
