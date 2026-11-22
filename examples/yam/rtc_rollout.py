@@ -65,6 +65,8 @@ class RolloutTelemetry:
         self.period_ms = 1000 / control_hz
         self.predictions = []
         self.hold_ticks = 0
+        self.observations = 0
+        self.without_capture_time = 0  # observations sent with no camera capture time
 
     def report(self):
         completed = 0
@@ -114,8 +116,9 @@ class RolloutTelemetry:
 
         logger.info(
             "RTC timing summary predictions=%d failed=%d prefix_rows_histogram=%s "
-            "late_handoffs=%d hold_ticks=%d tick_ms=%.1f",
+            "late_handoffs=%d hold_ticks=%d tick_ms=%.1f observations=%d without_capture_time=%d",
             completed, failed, dict(sorted(prefixes.items())), late_count, self.hold_ticks, self.period_ms,
+            self.observations, self.without_capture_time,
         )
         for name, values in metrics.items():
             median, p95, p99 = np.percentile(values, (50, 95, 99))
@@ -186,6 +189,10 @@ def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_i
     # An SDK that measures its control-loop latencies from the capture time takes it as
     # `t_captured`; an older one does not know the argument, and it stays in `meta` only.
     sdk_takes_capture_time = "t_captured" in inspect.signature(chunking.observations.put).parameters
+    if not sdk_takes_capture_time:
+        logger.warning("This orchestral SDK takes no t_captured: its observation-to-action and reaction "
+                       "spans start at the next tick, so Grafana's capture-time latency panels stay empty. "
+                       "Update the orchestral checkout.")
     sent = 0
     deadline = session.clock.now() + seconds
     while session.clock.now() < deadline:
@@ -216,10 +223,18 @@ def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_i
                 "queued_at": queued_at,
             }
             capture_time = {}
+            telemetry.observations += 1
             if captured_at is not None:
                 meta["captured_at"] = captured_at
                 if sdk_takes_capture_time:
                     capture_time["t_captured"] = captured_at
+            else:
+                telemetry.without_capture_time += 1
+                if telemetry.without_capture_time == 1:
+                    logger.warning("An observation has no camera capture time (a camera reported none, or "
+                                   "the wall clock stepped back): it is left out of the robot's latency report, "
+                                   "and its SDK spans start at the next tick (orc.loop.measured_from=observation), "
+                                   "outside Grafana's capture-time panels. The summary counts them.")
             chunking.observe(inputs=inputs, instruction=instruction, meta=meta, **capture_time)
         time.sleep(max(0.0, chunking.t_next - session.clock.now()))
     return {"rows_sent": sent, "hold_ticks": telemetry.hold_ticks, "late_chunks": chunking.late,
