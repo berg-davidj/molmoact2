@@ -58,6 +58,25 @@ def test_managed_cli_rejects_noise_seed_before_opening_session(family, monkeypat
     assert f"{family} does not support --noise-seed" in capsys.readouterr().err
 
 
+def test_managed_pi_dispatch_forwards_parsed_seed(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["managed_rollout.py", "--noise-seed=0"])
+    monkeypatch.setattr(
+        managed_rollout,
+        "Orchestral",
+        lambda: SimpleNamespace(
+            deployments=SimpleNamespace(get=lambda _: SimpleNamespace(model_id="pi05")),
+            _http=SimpleNamespace(close=lambda: None),
+        ),
+    )
+    dispatched_args = []
+    monkeypatch.setattr(managed_rollout.runpy, "run_path", lambda *args, **kwargs: dispatched_args.extend(sys.argv))
+
+    managed_rollout.main()
+
+    assert dispatched_args[0].endswith("rtc_rollout.py")
+    assert dispatched_args[-2:] == ["--noise-seed", "0"]
+
+
 def test_pi_rtc_attaches_seed_to_each_queued_prediction(monkeypatch):
     requests = []
     ticks = 0
