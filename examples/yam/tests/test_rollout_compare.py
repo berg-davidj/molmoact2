@@ -107,6 +107,40 @@ def test_no_verdict_from_too_few_or_too_similar_runs():
     assert summarize([run(1.0, chunk_fusion="rail")])[2].startswith("Only one combination")
 
 
+@pytest.mark.parametrize("third_score", [None, 1 / 3])
+def test_verdict_waits_for_a_third_combination_even_if_it_ranks_last(third_score):
+    runs = ([run(1.0, chunk_fusion="rail") for _ in range(3)]
+            + [run(2 / 3, chunk_fusion="splice") for _ in range(3)]
+            + [run(third_score, chunk_fusion="ensemble")])
+    _, _, line = summarize(runs)
+    assert line.startswith("No verdict yet")
+    assert f"each combination needs at least {MIN_RUNS}" in line
+
+
+@pytest.mark.parametrize("lead", [None, 8])
+def test_joint_rollout_records_resolved_prefetch_lead(lead, tmp_path, monkeypatch):
+    import managed_rollout
+
+    class SettingsSaved(Exception):
+        pass
+
+    def save_settings(path, settings):
+        record_settings(path, settings)
+        raise SettingsSaved
+
+    monkeypatch.setattr("builtins.input", lambda _: "")
+    monkeypatch.setattr(managed_rollout, "record_settings", save_settings)
+    recording = tmp_path / "run.rrd"
+    args = SimpleNamespace(policy_family="gr00t", control_hz=None, prefetch_lead_steps=lead,
+                           committed_actions=False, chunk_fusion="splice", fusion_rows=4, shadow=False,
+                           instruction="go", rrd=recording, deployment="gr00t-test", seconds=30, noise_seed=None)
+    identity = {"state_dim": 7, "action_horizon": 16, "action_dim": 7,
+                "camera_mapping": {"top": "top", "left": "left", "right": "right"}}
+    with pytest.raises(SettingsSaved):
+        managed_rollout.rollout_joint_policy(None, identity, args)
+    assert read_sidecar(recording)["settings"]["prefetch_lead_steps"] == 8
+
+
 def test_settings_are_saved_beside_the_recording_and_scored_later(tmp_path, capsys):
     recording = tmp_path / "pi05-holesaw_20261122_150000.rrd"
     recording.write_bytes(b"")
@@ -274,3 +308,27 @@ def test_time_and_drops_are_part_of_a_score(tmp_path, capsys):
     assert "2 of 3 placed in 48.5 s, 1 dropped" in capsys.readouterr().out
     main(["--dir", str(tmp_path), "score", "--drops", "0"])  # a correction keeps the rest
     assert read_sidecar(recording)["outcome"] == {"placed": 2, "out_of": 3, "note": "", "time": 48.5, "drops": 0}
+
+
+@pytest.mark.parametrize("out_of", ["0", "-1"])
+def test_score_rejects_nonpositive_out_of(tmp_path, out_of):
+    recording = tmp_path / "run.rrd"
+    recording.touch()
+    with pytest.raises(SystemExit, match="--out-of must be positive"):
+        main(["--dir", str(tmp_path), "score", "--placed", "0", "--out-of", out_of])
+    assert not rollout_compare.sidecar_path(recording).exists()
+
+
+def test_compare_skips_a_legacy_zero_denominator(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(rollout_compare, "measure_recording", lambda *args, **kwargs: None)
+    for name, out_of in (("bad", 0), ("good", 3)):
+        recording = tmp_path / f"{name}.rrd"
+        recording.touch()
+        rollout_compare.sidecar_path(recording).write_text(json.dumps({
+            "settings": {"deployment": "pi05-test", "chunk_fusion": "rail"},
+            "outcome": {"placed": 0, "out_of": out_of},
+        }))
+    main(["--dir", str(tmp_path)])
+    captured = capsys.readouterr()
+    assert "pi05-test: 1 runs, 1 combinations" in captured.out
+    assert "bad.run.json: invalid run settings (out_of must be a positive integer)" in captured.err
