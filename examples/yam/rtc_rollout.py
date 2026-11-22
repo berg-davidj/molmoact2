@@ -24,7 +24,8 @@ rig, cameras, safety mask and rest-pose return are the launcher's own; only the 
       --right-config-path examples/yam/configs/pi05_right_primary.yaml \\
       --orchestral-deployment dep_xxxxxxxxxxxx --active-arm-side left --seconds 60
 
-Ctrl-C ends the rollout. Requires an Orchestral SDK (``orchestral-labs``) with
+Ctrl-C ends the rollout, and so does a failed prediction unless ``--max-prediction-failures``
+allows some (a long run over a real network). Requires an Orchestral SDK (``orchestral-labs``) with
 ``orchestral.RealTimeChunking``.
 """
 
@@ -67,6 +68,7 @@ class RolloutTelemetry:
         self.hold_ticks = 0
         self.observations = 0
         self.without_capture_time = 0  # observations sent with no camera capture time
+        self.failed_predictions = 0  # failed predictions the loop held through or stopped on
 
     def report(self):
         completed = 0
@@ -174,8 +176,28 @@ def make_chunking(session: Any, control_hz: float, *, s_min: int, d_init: int, r
     return YamRealTimeChunking(session, control_hz, s_min=s_min, d_init=d_init)
 
 
+def next_row(chunking, telemetry: RolloutTelemetry, max_prediction_failures: int):
+    """This tick's row, or None to hold.
+
+    A failed prediction drops the running chunk, so the arm holds its last target. Up to
+    ``max_prediction_failures`` of them hold this tick and let planning restart; the next one
+    is raised and ends the rollout.
+    """
+    from orchestral import PredictionFailed
+
+    try:
+        return chunking.action()
+    except PredictionFailed as failed:
+        telemetry.failed_predictions += 1
+        if telemetry.failed_predictions > max_prediction_failures:
+            raise
+        logger.warning("Prediction failure %d of %d allowed, holding: %s",
+                       telemetry.failed_predictions, max_prediction_failures, failed)
+        return None
+
+
 def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_init: int,
-        seconds: float, telemetry: RolloutTelemetry) -> dict:
+        seconds: float, telemetry: RolloutTelemetry, max_prediction_failures: int = 0) -> dict:
     """The control loop: one row per tick, one prediction in flight, until ``seconds`` or Ctrl-C."""
     endpoint_dim = host.identity["state_dim"]
     if endpoint_dim == ARM_DIM:
@@ -197,12 +219,12 @@ def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_i
     deadline = session.clock.now() + seconds
     while session.clock.now() < deadline:
         with chunking.actions.lock:
-            row = chunking.action()
+            row = next_row(chunking, telemetry, max_prediction_failures)
             if row is not None:
                 query_state = chunking.rows.chunk.meta["query_state"]
         measured = mask.validate_state(env.get_robot_state()["joint_positions"], name="measured_state")
         if row is None:
-            telemetry.hold_ticks += 1  # first chunk or late prediction: keep the last target
+            telemetry.hold_ticks += 1  # first chunk, late or failed prediction: keep the last target
         else:
             target = measured.copy()
             target[endpoint] = host.robot_actions(row, query_state)
@@ -237,7 +259,8 @@ def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_i
                                    "outside Grafana's capture-time panels. The summary counts them.")
             chunking.observe(inputs=inputs, instruction=instruction, meta=meta, **capture_time)
         time.sleep(max(0.0, chunking.t_next - session.clock.now()))
-    return {"rows_sent": sent, "hold_ticks": telemetry.hold_ticks, "late_chunks": chunking.late,
+    return {"rows_sent": sent, "hold_ticks": telemetry.hold_ticks,
+            "failed_predictions": telemetry.failed_predictions, "late_chunks": chunking.late,
             "delays_ticks": list(chunking.delays), "rows_run_before_takeover": list(chunking.k)}
 
 
@@ -259,6 +282,9 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument("--s-min", type=int, default=7, help="rows of a chunk to run before the next request")
     parser.add_argument("--d-init", type=int, default=2, help="prediction delay in ticks until one is measured")
     parser.add_argument("--seconds", type=float, default=60.0, help="rollout length")
+    parser.add_argument("--max-prediction-failures", type=int, default=0,
+                        help="failed predictions to hold through before one ends the rollout (default 0: "
+                             "the first one ends it)")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 
@@ -280,9 +306,9 @@ def main(argv: Optional[list] = None) -> int:
     adapter = args.policy_adapter or (eval_cfg.get("server") or {}).get("policy_adapter", "identity")
 
     try:
-        from orchestral import RealTimeChunking  # noqa: F401
+        from orchestral import PredictionFailed, RealTimeChunking  # noqa: F401
     except ImportError as exc:
-        parser.exit(1, f"RTC requires an Orchestral SDK with RealTimeChunking: {exc}\n")
+        parser.exit(1, f"RTC requires an Orchestral SDK with RealTimeChunking and PredictionFailed: {exc}\n")
 
     # Verify the Session before opening the motors.
     if args.orchestral_grant:
@@ -317,7 +343,8 @@ def main(argv: Optional[list] = None) -> int:
             completed = True
             try:
                 summary = run(env, host, mask, control_hz=control_hz, instruction=instruction,
-                              s_min=args.s_min, d_init=args.d_init, seconds=args.seconds, telemetry=telemetry)
+                              s_min=args.s_min, d_init=args.d_init, seconds=args.seconds, telemetry=telemetry,
+                              max_prediction_failures=args.max_prediction_failures)
                 logger.info("Rollout summary: %s", summary)
             except KeyboardInterrupt:
                 logger.info("Interrupted")
