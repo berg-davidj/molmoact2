@@ -206,7 +206,26 @@ def measure_recording(path, *, shadow):
 
 
 def load_run(path):
-    record = read_sidecar(path)
+    try:
+        record = read_sidecar(path)
+        if not isinstance(record, dict) or not isinstance(record.get("settings"), dict):
+            raise ValueError("expected a settings object")
+        outcome = record.get("outcome")
+        success = None
+        if outcome is None:
+            outcome = {}
+        elif not isinstance(outcome, dict):
+            raise ValueError("expected an outcome object")
+        elif (placed := outcome.get("placed")) is not None:
+            out_of = outcome.get("out_of")
+            if type(out_of) is not int or out_of <= 0:
+                raise ValueError("out_of must be a positive integer")
+            if type(placed) is not int or not 0 <= placed <= out_of:
+                raise ValueError(f"placed must be an integer between 0 and {out_of}")
+            success = placed / out_of
+    except (OSError, ValueError) as error:
+        print(f"{sidecar_path(path).name}: invalid run settings ({error})", file=sys.stderr)
+        return None
     settings = record["settings"]
     shadow = settings.get("execution_mode") == "shadow"
     try:
@@ -214,10 +233,6 @@ def load_run(path):
     except Exception as error:  # noqa: BLE001 - one unreadable recording must not hide the others
         print(f"{Path(path).name}: could not read the trace ({error})", file=sys.stderr)
         measures = None
-    outcome = record.get("outcome") or {}
-    success = None
-    if outcome.get("placed") is not None:
-        success = outcome["placed"] / outcome["out_of"]
     return {"path": Path(path), "settings": settings, "shadow": shadow, "measures": measures,
             "success": success, "outcome": outcome}
 
@@ -263,9 +278,9 @@ def verdict(varying, combinations):
                 "`rollout_compare.py score --placed N`.")
     best, second = scored[0], scored[1]
     name = ", ".join(f"{setting}={value}" for setting, value in zip(varying, best["key"]))
-    if min(best["scored"], second["scored"]) < MIN_RUNS:
-        return (f"No verdict yet: {name} is ahead, but a combination needs at least {MIN_RUNS} scored runs "
-                "(run-to-run variation on a conveyor task is large).")
+    if any(combination["scored"] < MIN_RUNS for combination in combinations):
+        return (f"No verdict yet: {name} is ahead, but each combination needs at least "
+                f"{MIN_RUNS} scored runs.")
     # Two standard errors of the difference between the two best means.
     margin = 2 * math.sqrt(best["spread"] ** 2 / best["scored"] + second["spread"] ** 2 / second["scored"])
     if best["success"] - second["success"] > margin:
@@ -325,6 +340,8 @@ def _setting(text):
 
 
 def score(args):
+    if args.out_of <= 0:
+        raise SystemExit("--out-of must be positive")
     recording = resolve_recording(args.run, args.dir)
     record = read_sidecar(recording)
     record["settings"].update(dict(args.set))
@@ -362,6 +379,8 @@ def compare(args):
     by_deployment = {}
     skipped = {"shadow": 0, "no trace": 0, "no settings": 0}
     for run in runs:
+        if run is None:
+            continue  # load_run already reported the invalid sidecar
         if run["shadow"]:
             skipped["shadow"] += 1
         elif not any(key in run["settings"] for key in TUNABLE):

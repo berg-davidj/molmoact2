@@ -56,6 +56,8 @@ class _RedCapModel:
             raise ValueError("this observation fails")
         actions = np.full((H, WIDTH), 0.25, np.float32)
         actions[:, :6] = planned_targets(state[0]) - state[1]
+        if state[0] == 123:
+            actions[-1, 0] = np.nan
         return actions
 
     @property
@@ -79,7 +81,8 @@ def grant():
     worker.close()
 
 
-def rollout(grant, mode, *, late=None, fail=None, delay=2, ticks=60, fusion_rows=4):
+def rollout(grant, mode, *, late=None, fail=None, malformed=None, record_prediction=None,
+            delay=2, ticks=60, fusion_rows=4):
     """The rig's chunking on a clock the test advances one tick at a time.
 
     A prediction requested in tick T is delivered just after tick T + delay; the one numbered
@@ -105,7 +108,8 @@ def rollout(grant, mode, *, late=None, fail=None, delay=2, ticks=60, fusion_rows
     clock = [0.1]
     sent, requested, due, errors = [], 0, None, 0
     with Session(grant, clock=lambda: clock[0]) as session:
-        chunking = make_chunking(session, 20.0, s_min=7, d_init=2, rebase_joints=6, fusion=fusion)
+        chunking = make_chunking(session, 20.0, s_min=7, d_init=2, rebase_joints=6,
+                                 fusion=fusion, record_prediction=record_prediction)
         prepare, deliver = chunking._prepare, chunking._deliver
         chunking.observations._prepare = lambda observation: (prepare(observation), prepared.set())[0]
         chunking.actions._on_deliver = lambda chunk: (deliver(chunk), delivered.set())[0]
@@ -130,6 +134,8 @@ def rollout(grant, mode, *, late=None, fail=None, delay=2, ticks=60, fusion_rows
                 if chunking.should_replan():
                     prepared.clear()
                     label = -1.0 if requested == fail else float(requested)
+                    if requested == malformed:
+                        label = 123.0
                     # Each query is taken from a different arm position, as on the rig.
                     query_state = np.full(7, 0.11 * requested, np.float32)
                     state = np.array([label, query_state[0], 0, 0, 0, 0, 0], np.float32)
@@ -207,6 +213,27 @@ def test_a_hold_or_failure_starts_a_new_plan(grant):
         for takeover in restarted:
             k = takeover["rows_run"]
             np.testing.assert_allclose(takeover["fused"][k:], takeover["raw"][k:], atol=1e-5)
+
+
+@pytest.mark.parametrize("mode", ["splice", "rail"])
+def test_nonfinite_prediction_is_reported_and_the_next_prediction_runs(grant, mode):
+    recorded = []
+    sent, _, _, errors = rollout(grant, mode, malformed=2,
+                                 record_prediction=lambda chunk: recorded.append(chunk.seq))
+    assert errors == 1
+    assert 2 not in recorded
+    assert any(row is not None and row[0] > 2 for row in sent)
+
+
+def test_trace_exception_does_not_interrupt_action_delivery(grant, caplog):
+    def record_prediction(chunk):
+        if chunk.seq == 2:
+            raise OSError("trace unavailable")
+
+    sent, _, _, errors = rollout(grant, "splice", record_prediction=record_prediction)
+    assert errors == 0
+    assert "trace unavailable" in caplog.text
+    assert {2, 3} <= {row[0] for row in sent if row is not None}
 
 
 def test_fusion_needs_a_single_arm_endpoint():

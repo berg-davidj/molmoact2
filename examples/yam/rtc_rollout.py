@@ -204,6 +204,8 @@ def make_chunking(session: Any, control_hz: float, *, s_min: int, d_init: int, r
     """
     from orchestral import RealTimeChunking
 
+    action_shape = tuple(session.grant.io_spec.action_shape)
+
     class YamRealTimeChunking(RealTimeChunking):
         def _frozen_rows(self, s):
             # A prediction can arrive before the next tick. Once only zero-tick
@@ -222,16 +224,31 @@ def make_chunking(session: Any, control_hz: float, *, s_min: int, d_init: int, r
 
         def _deliver(self, chunk):
             late_before = self.late
+            if chunk.error is None and (np.shape(chunk.actions) != action_shape
+                                        or not np.isfinite(chunk.actions).all()):
+                chunk = chunk._replace(actions=(), error=ValueError(
+                    f"RTC prediction must contain finite actions with shape {action_shape}"))
             delivered = super()._deliver(chunk)
-            if telemetry is not None:
-                telemetry.predictions.append((chunk, self.late > late_before))
-            if record_prediction is not None and chunk.error is None:
-                record_prediction(delivered)  # as the model returned it, before any fusion
+            late = self.late > late_before
+            raw = delivered
             if fusion is not None:
                 if chunk.error is not None:
                     fusion.reset()
                 else:
-                    delivered = fusion.fuse(delivered, self.k[-1], after_hold=self.late > late_before)
+                    try:
+                        delivered = fusion.fuse(delivered, self.k[-1], after_hold=late)
+                    except Exception as error:
+                        # The SDK's delivery hook runs outside its prediction error handler.
+                        fusion.reset()
+                        self.actions.clear()
+                        chunk = delivered = chunk._replace(actions=(), error=error)
+            if telemetry is not None:
+                telemetry.predictions.append((chunk, late))
+            if record_prediction is not None and chunk.error is None:
+                try:
+                    record_prediction(raw)
+                except Exception:
+                    logger.exception("Could not record RTC prediction %d", chunk.seq)
             return delivered
 
     return YamRealTimeChunking(session, control_hz, s_min=s_min, d_init=d_init)

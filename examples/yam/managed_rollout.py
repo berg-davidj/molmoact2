@@ -199,7 +199,7 @@ def rollout_joint_policy(host, identity, args):
     record_settings(output_path, dict(
         deployment=args.deployment, family=args.policy_family, control_hz=args.control_hz,
         chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows,
-        prefetch_lead_steps=args.prefetch_lead_steps, committed_actions=args.committed_actions,
+        prefetch_lead_steps=lead_steps, committed_actions=args.committed_actions,
         execution_mode="shadow" if args.shadow else "active_arm_hold",
         seconds=args.seconds, noise_seed=args.noise_seed, instruction=args.instruction))
     sensor_roles = {
