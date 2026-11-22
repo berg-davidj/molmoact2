@@ -325,8 +325,11 @@ PYTHONPATH=examples/yam python examples/yam/rtc_rollout.py \
 - `--d-init` (default 2): prediction delay in ticks assumed until one is measured.
 - The red-cap model predicts joint deltas from its query state, so committed rows
   are re-expressed from the previous query state to the new one before they are sent.
-- A failed prediction ends the rollout (the arm holds its last target). The summary
-  logs rows sent, hold ticks, late chunks and measured delays.
+- A failed prediction ends the rollout (the arm holds its last target). For a long
+  run, `--max-prediction-failures N` holds through the first N instead: the arm keeps
+  its last target until the Session answers again, which can take over a minute, then
+  moves on from where it held. Failure N+1 ends the rollout. The summary logs rows
+  sent, hold ticks, failed predictions, late chunks and measured delays.
 - The timing report at exit prints n, p50, p95, p99 and max per measure.
   `observation_to_action_ms` runs from the capture of the oldest camera frame in an
   observation to its chunk arriving back on the robot, both on the robot's clocks.
