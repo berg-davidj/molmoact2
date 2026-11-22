@@ -129,7 +129,16 @@ class V4L2Camera:
                 self._stop_event.wait(remaining)
 
     def read(self, img_size: Optional[Tuple[int, int]] = None):
-        """Return a cached frame immediately after the initial capture.
+        """The cached frame as ``(rgb, depth)``; see ``read_with_timestamp``."""
+        rgb, depth, _timestamp = self.read_with_timestamp(img_size)
+        return rgb, depth
+
+    def read_with_timestamp(self, img_size: Optional[Tuple[int, int]] = None):
+        """Return a cached frame immediately after the initial capture, with its capture time.
+
+        Returns ``(rgb, depth, timestamp)``; ``timestamp`` is the ``time.time()`` at which the
+        capture thread stored this frame, taken under the same lock as the frame, so it
+        belongs to the frame returned even when other threads read the camera too.
 
         At most one initial call waits for a camera frame.  Subsequent calls
         do not wait for a new image, which lets the robot command loop remain
@@ -161,7 +170,7 @@ class V4L2Camera:
             depth = cv2.resize(depth, img_size)
             if depth.ndim == 2:
                 depth = depth[:, :, None]
-        return rgb, depth
+        return rgb, depth, timestamp
 
     def close(self) -> None:
         self._stop_event.set()

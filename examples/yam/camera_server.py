@@ -92,11 +92,16 @@ class CameraServer:
         frames: Dict[str, Any] = {}
         timestamps: Dict[str, float] = {}
         for name, cam in self.cameras.items():
-            image, _depth = cam.read()
+            # The capture time of the frame returned, so the client can detect staleness and
+            # time from capture. Two threads snapshot the cameras, so it must come with the frame.
+            read_with_timestamp = getattr(cam, "read_with_timestamp", None)
+            if read_with_timestamp is not None:
+                image, _depth, ts = read_with_timestamp()
+            else:
+                image, _depth = cam.read()
+                ts = getattr(cam, "_latest_frame_timestamp", None)
             frames[name] = image
-            # Surface the capture timestamp so the client can detect staleness.
-            ts = getattr(cam, "_latest_frame_timestamp", None) or 0.0
-            timestamps[name] = float(ts)
+            timestamps[name] = float(ts or 0.0)
         return {"ok": True, "frames": frames, "timestamps": timestamps}
 
     # ------------------------------------------------------------------

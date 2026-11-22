@@ -136,6 +136,19 @@ class RealSenseCamera(CameraDriver):
             np.ndarray: The color image, shape=(H, W, 3)
             np.ndarray: The depth image, shape=(H, W, 1)
         """
+        image, depth, _timestamp = self.read_with_timestamp(img_size)
+        return image, depth
+
+    def read_with_timestamp(
+        self,
+        img_size: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, float]:
+        """``read()`` plus the frame's capture time.
+
+        The third value is the ``time.time()`` at which the capture thread stored this
+        frame, taken under the same lock as the frame, so it belongs to the frame returned
+        even when other threads read the camera too.
+        """
         import cv2
 
         if not self._frame_ready.wait(timeout=self._read_wait_timeout_sec):
@@ -172,7 +185,7 @@ class RealSenseCamera(CameraDriver):
 
         depth = depth[:, :, None]
 
-        return image, depth
+        return image, depth, frame_timestamp
 
 
 def _debug_read(camera, save_datastream=False):
