@@ -34,6 +34,14 @@ TEMPORAL_JOINT_ADAPTER = "temporal_joint"
 GR00T_YAM_ADAPTER = "gr00t_yam"
 NOISE_SCHEME = "numpy-pcg64-15x32-fp32-v1"
 
+
+def parse_noise_seed(value: str) -> int:
+    seed = int(value)
+    if not 0 <= seed < 2**64:
+        raise ValueError("noise seed must be an unsigned 64-bit integer")
+    return seed
+
+
 #: Environment variable naming a Python >= 3.12 interpreter that can import the
 #: official ``orchestral`` package, used when the robot runtime cannot.
 ORCHESTRAL_PYTHON_ENV = "ORCHESTRAL_PYTHON"

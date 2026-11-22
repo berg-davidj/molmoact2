@@ -37,7 +37,7 @@ def frames_for_policy(obs, camera_shapes, camera_bindings=CAMERAS):
 def checked_chunk(session, cameras, state, instruction, *, episode_start, action_shape=ACTION_SHAPE,
                   model_label="GR00T", gripper_tolerance=0.05, pose_actions=None, matrix_policy=False,
                   observation_time=None, max_plan_rows=None, history_inputs=None, trace=None, prediction_id=0,
-                  state_padding=None, committed_actions=None):
+                  state_padding=None, committed_actions=None, noise_seed=None):
     start = time.monotonic()
     query_state = pose_actions.state(state, matrix_policy=matrix_policy) if pose_actions else state
     if state_padding is not None:
@@ -54,6 +54,8 @@ def checked_chunk(session, cameras, state, instruction, *, episode_start, action
             parked = np.broadcast_to(state_padding, (len(committed_actions), len(state_padding)))
             committed_actions = np.concatenate([committed_actions, parked], axis=1)
         sensors["committed_actions"] = committed_actions
+    if noise_seed is not None:
+        sensors["noise_seed"] = noise_seed
     response = session.predict(cameras=cameras, state=query_state, instruction=instruction,
                                episode_start=episode_start, **sensors)
     chunk = np.asarray(response.actions, dtype=np.float32)
@@ -100,7 +102,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
         action_shape=ACTION_SHAPE, model_label="GR00T", gripper_tolerance=0.05, pose_actions=None, matrix_policy=False,
         timestamp_observations=False, max_plan_rows=None, temporal_history=None, trace=None,
         state_padding=None, chunk_fusion="splice", fusion_rows=4, committed_actions=False,
-        stream_observations=False):
+        stream_observations=False, noise_seed=None):
     if committed_actions and (chunk_fusion != "splice" or lead_steps < 1):
         raise ValueError("Committed actions require splice and at least one prefetch lead step")
     period = 1 / control_hz
@@ -194,7 +196,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                                           matrix_policy=matrix_policy, observation_time=observation_time,
                                           max_plan_rows=max_plan_rows, history_inputs=history_inputs,
                                           trace=trace, prediction_id=predictions + 1,
-                                          state_padding=state_padding, committed_actions=prefix)
+                                          state_padding=state_padding, committed_actions=prefix, noise_seed=noise_seed)
                 predictions += 1
             elif stream_observations:
                 # Use the prediction executor to preserve Session order without blocking the control tick.

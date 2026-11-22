@@ -317,6 +317,10 @@ use splice handoffs. FLUX Workers serving the Holesaw checkpoint need
 default). Long-WAM also streams each intervening camera observation to its
 Worker, using an SDK with `Session.observe`.
 
+`--noise-seed N` sends the same per-query seed on ordinary and committed
+predictions for pi0.5, FLUX.3 Action, and Long-WAM, including in `--probe`.
+Omit it to leave the Worker's sampling behavior at its default.
+
 ```bash
 examples/yam/run-rollout.sh --deployment <deployment-id> --probe
 ```

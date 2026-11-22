@@ -1,0 +1,98 @@
+import sys
+from threading import Lock
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+import managed_rollout
+import rtc_rollout
+
+
+@pytest.mark.parametrize("family", ["pi05", "flux3-action", "longwam"])
+def test_seeded_probe_checks_both_prediction_paths(family):
+    requests = []
+    observations = []
+
+    def predict(**kwargs):
+        requests.append(kwargs)
+        return SimpleNamespace(actions=np.full((15, 7), 0.5, dtype=np.float32))
+
+    host = SimpleNamespace(
+        identity={"state_dim": 7, "action_horizon": 15, "action_dim": 7, "camera_mapping": {"top": "scene"}},
+        supports_committed_actions=lambda: True,
+        begin_episode=lambda: None,
+        session=SimpleNamespace(
+            predict=predict,
+            supports_observe=True,
+            observe=lambda **kwargs: observations.append(kwargs),
+            grant=SimpleNamespace(io_spec=SimpleNamespace(cameras={"scene": (4, 4)})),
+        ),
+    )
+    managed_rollout.probe(host, family, "go", committed_actions=True, noise_seed=2**64 - 1)
+
+    first, continued = requests
+    assert first["noise_seed"] == continued["noise_seed"] == 2**64 - 1
+    assert first["episode_start"]
+    assert "committed_actions" not in first
+    np.testing.assert_array_equal(continued["committed_actions"], np.full((1, 7), 0.5))
+    if family == "longwam":
+        assert len(observations) == 1
+        assert "noise_seed" not in observations[0]
+
+
+@pytest.mark.parametrize("family", ["gr00t", "isaac05", "molmoact2"])
+def test_managed_cli_rejects_noise_seed_before_opening_session(family, monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["managed_rollout.py", "--noise-seed", "0"])
+    monkeypatch.setattr(
+        managed_rollout,
+        "Orchestral",
+        lambda: SimpleNamespace(
+            deployments=SimpleNamespace(get=lambda _: SimpleNamespace(model_id=family)),
+            _http=SimpleNamespace(close=lambda: None),
+        ),
+    )
+    with pytest.raises(SystemExit) as error:
+        managed_rollout.main()
+    assert error.value.code == 2
+    assert f"{family} does not support --noise-seed" in capsys.readouterr().err
+
+
+def test_pi_rtc_attaches_seed_to_each_queued_prediction(monkeypatch):
+    requests = []
+    ticks = 0
+
+    def sleep(_seconds):
+        nonlocal ticks
+        ticks += 1
+
+    state = np.zeros(14, dtype=np.float32)
+    image = np.zeros((4, 4, 3), dtype=np.uint8)
+    host = SimpleNamespace(
+        identity={"state_dim": 7, "camera_mapping": {"top": "scene"}},
+        policy_adapter="pi05_yam_red_cap",
+        session=SimpleNamespace(clock=SimpleNamespace(now=lambda: ticks)),
+        predict_inputs=lambda images, positions, **kwargs: ({"scene": images["top"], "state": positions}, positions),
+    )
+    env = SimpleNamespace(
+        get_robot_state=lambda: {"joint_positions": state},
+        get_obs=lambda: {"joint_positions": state, "front_camera_rgb": image},
+    )
+    mask = SimpleNamespace(active_arm_side="left", validate_state=lambda positions, **kwargs: positions)
+    chunking = SimpleNamespace(
+        observations=SimpleNamespace(put=lambda *, t_captured=None: None),
+        actions=SimpleNamespace(lock=Lock()),
+        action=lambda: None,
+        should_replan=lambda: True,
+        observe=lambda **kwargs: requests.append(kwargs),
+        t_next=1,
+        late=0,
+        delays=[],
+        k=[],
+    )
+    monkeypatch.setattr(rtc_rollout, "make_chunking", lambda *args, **kwargs: chunking)
+    monkeypatch.setattr(rtc_rollout.time, "sleep", sleep)
+    rtc_rollout.run(env, host, mask, control_hz=15, instruction="go", s_min=7, d_init=2, seconds=2,
+                    telemetry=rtc_rollout.RolloutTelemetry(15), noise_seed=0)
+
+    assert [request["noise_seed"] for request in requests] == [0, 0]

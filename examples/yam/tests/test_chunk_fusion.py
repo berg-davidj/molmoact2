@@ -190,7 +190,8 @@ def test_rollout_loop_commands_a_continuous_stream(mode, monkeypatch):
 
 
 @pytest.mark.parametrize("bimanual,stateful", [(False, False), (True, False), (False, True)])
-def test_rollout_commits_the_queued_targets_before_appending_a_suffix(bimanual, stateful, monkeypatch):
+@pytest.mark.parametrize("noise_seed", [None, 0])
+def test_rollout_commits_the_queued_targets_before_appending_a_suffix(bimanual, stateful, noise_seed, monkeypatch):
     groot_rollout = pytest.importorskip("groot_rollout")
     monkeypatch.setattr(groot_rollout, "ThreadPoolExecutor", _InlinePredictor)
     clock = iter(np.arange(0, 1000, 0.001))
@@ -201,7 +202,8 @@ def test_rollout_commits_the_queued_targets_before_appending_a_suffix(bimanual, 
     groot_rollout.run(env, session, _Mask(), seconds=0.4, instruction="go", shadow=False,
                       camera_bindings={"top": "front_camera_rgb"}, history_offsets=(), lead_steps=4,
                       action_shape=(16, 14 if bimanual else 7), state_padding=parked,
-                      timestamp_observations=bimanual, committed_actions=True, stream_observations=stateful)
+                      timestamp_observations=bimanual, committed_actions=True, stream_observations=stateful,
+                      noise_seed=noise_seed)
     assert session.requests[0][:2] == (True, None)
     _, prefix, sensors = session.requests[1]
     assert len(prefix) == 4
@@ -212,6 +214,11 @@ def test_rollout_commits_the_queued_targets_before_appending_a_suffix(bimanual, 
         assert sensors["timestamp"][0] > 0
     if stateful:
         assert session.observations == list(range(env.frame))
+    for _, _, prediction_kwargs in session.requests:
+        if noise_seed is None:
+            assert "noise_seed" not in prediction_kwargs
+        else:
+            assert prediction_kwargs["noise_seed"] == noise_seed
 
 
 def test_checked_chunk_rejects_changed_committed_rows():

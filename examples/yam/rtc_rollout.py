@@ -46,14 +46,8 @@ from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from launch_yaml_eval_molmoact import (  # noqa: E402
-    _build_env,
-    resolve_bimanual_execution_mask,
-    return_to_captured_rest_pose,
-    validate_bimanual_model_arm_order,
-)
 from frame_capture_time import session_capture_time  # noqa: E402
-from orchestral_session_bridge import OrchestralDirectHost, OrchestralSessionHost  # noqa: E402
+from orchestral_session_bridge import OrchestralDirectHost, OrchestralSessionHost, parse_noise_seed  # noqa: E402
 from rtc_camera_frames import RtcCameraFrames, frame_times  # noqa: E402
 
 logger = logging.getLogger("rtc_rollout")
@@ -207,7 +201,7 @@ def next_row(chunking, telemetry: RolloutTelemetry, max_prediction_failures: int
 
 def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_init: int,
         seconds: float, telemetry: RolloutTelemetry, max_prediction_failures: int = 0,
-        camera_frames: RtcCameraFrames | None = None) -> dict:
+        camera_frames: RtcCameraFrames | None = None, noise_seed: int | None = None) -> dict:
     """The control loop: one row per tick, one prediction in flight, until ``seconds`` or Ctrl-C."""
     endpoint_dim = host.identity["state_dim"]
     if endpoint_dim == ARM_DIM:
@@ -226,6 +220,7 @@ def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_i
         logger.warning("This orchestral SDK takes no t_captured: its observation-to-action and reaction "
                        "spans start at the next tick, so Grafana's capture-time latency panels stay empty. "
                        "Update the orchestral checkout.")
+    noise = {} if noise_seed is None else {"noise_seed": noise_seed}
     sent = 0
     deadline = session.clock.now() + seconds
     while session.clock.now() < deadline:
@@ -284,7 +279,7 @@ def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_i
                                    "the wall clock stepped back): it is left out of the robot's latency report, "
                                    "and its SDK spans start at the next tick (orc.loop.measured_from=observation), "
                                    "outside Grafana's capture-time panels. The summary counts them.")
-            chunking.observe(inputs=inputs, instruction=instruction, meta=meta, **capture_time)
+            chunking.observe(inputs=inputs, instruction=instruction, meta=meta, **capture_time, **noise)
         time.sleep(max(0.0, chunking.t_next - session.clock.now()))
     return {"rows_sent": sent, "hold_ticks": telemetry.hold_ticks,
             "failed_predictions": telemetry.failed_predictions, "late_chunks": chunking.late,
@@ -305,6 +300,7 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument("--policy-adapter", choices=["identity", "pi05_yam_red_cap"], default=None,
                         help="default: config eval.server.policy_adapter")
     parser.add_argument("--instruction", default=None, help="default: config storage.language_instruction")
+    parser.add_argument("--noise-seed", type=parse_noise_seed, help="Fixed noise seed for each prediction")
     parser.add_argument("--control-hz", type=float, default=None, help="default: config hz (15 for red-cap)")
     parser.add_argument("--camera-fps", type=int, help="RTC V4L2 capture rate (default: rig config)")
     parser.add_argument("--s-min", type=int, default=7, help="rows of a chunk to run before the next request")
@@ -314,6 +310,12 @@ def main(argv: Optional[list] = None) -> int:
                         help="failed predictions to hold through before one ends the rollout (default 0: "
                              "the first one ends it)")
     args = parser.parse_args(argv)
+    from launch_yaml_eval_molmoact import (
+        _build_env,
+        resolve_bimanual_execution_mask,
+        return_to_captured_rest_pose,
+        validate_bimanual_model_arm_order,
+    )
     if args.camera_fps is not None and args.camera_fps < 1:
         parser.error("--camera-fps must be positive")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
@@ -397,7 +399,8 @@ def main(argv: Optional[list] = None) -> int:
             try:
                 summary = run(env, host, mask, control_hz=control_hz, instruction=instruction,
                               s_min=args.s_min, d_init=args.d_init, seconds=args.seconds, telemetry=telemetry,
-                              max_prediction_failures=args.max_prediction_failures, camera_frames=camera_frames)
+                              max_prediction_failures=args.max_prediction_failures, camera_frames=camera_frames,
+                              noise_seed=args.noise_seed)
                 logger.info("Rollout summary: %s", summary)
             except KeyboardInterrupt:
                 logger.info("Interrupted")

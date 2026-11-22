@@ -30,6 +30,7 @@ ISAAC_PARKED_RIGHT_ARM = np.array([0, 0, 0, 0, 0, 0, 1], dtype=np.float32)
 ISAAC_BIMANUAL_CONTROL_HZ = 30  # the release checkpoint's rate; one action per 30 Hz step
 ISAAC_BIMANUAL_PLAN_ROWS = 30   # replan every second instead of running the full 2 s chunk
 COMMITTED_ACTION_FAMILIES = frozenset({"gr00t", "isaac05", "flux3-action", "molmoact2", "longwam"})
+NOISE_SEED_FAMILIES = frozenset({"pi05", "flux3-action", "longwam"})
 
 original_init = ManagedTailnetNode.__init__
 original_run = TailscaleCli.run
@@ -70,14 +71,15 @@ def placeholder_state(family, dimension):
     return state
 
 
-def probe(host, family, instruction, *, committed_actions=False):
+def probe(host, family, instruction, *, committed_actions=False, noise_seed=None):
     if family == "pi05":
         if not host.supports_committed_actions():
             raise SystemExit("The pi0.5 Worker did not confirm committed-actions support.")
-        print("Staging pi0.5 session opened and RTC support confirmed.")
-        return
-
-    if committed_actions and not host.supports_committed_actions():
+        if noise_seed is None:
+            print("Staging pi0.5 session opened and RTC support confirmed.")
+            return
+        committed_actions = True
+    elif committed_actions and not host.supports_committed_actions():
         raise SystemExit(
             f"The {family} Worker does not advertise committed actions. "
             "Select an RTC-capable Worker or pass --no-committed-actions."
@@ -100,7 +102,8 @@ def probe(host, family, instruction, *, committed_actions=False):
         state[7:] = ISAAC_PARKED_RIGHT_ARM
 
     predict = dict(cameras=cameras, instruction=instruction, **inputs)
-    actions = np.asarray(host.session.predict(**predict, episode_start=True).actions, dtype=np.float32)
+    noise = {} if noise_seed is None else {"noise_seed": noise_seed}
+    actions = np.asarray(host.session.predict(**predict, **noise, episode_start=True).actions, dtype=np.float32)
     expected = (host.identity["action_horizon"], host.identity["action_dim"])
     if actions.shape != expected or not np.isfinite(actions).all():
         raise SystemExit(f"{family} did not return a finite action chunk of shape {expected}.")
@@ -111,7 +114,9 @@ def probe(host, family, instruction, *, committed_actions=False):
         prefix[:, 6] = np.clip(prefix[:, 6], 0, 1)
         if family == "isaac05" and expected[1] == 14:
             prefix[:, 7:] = ISAAC_PARKED_RIGHT_ARM
-        continued = np.asarray(host.session.predict(**predict, committed_actions=prefix).actions, dtype=np.float32)
+        continued = np.asarray(
+            host.session.predict(**predict, **noise, committed_actions=prefix).actions, dtype=np.float32,
+        )
         if continued.shape != expected or not np.isfinite(continued).all() or not np.array_equal(continued[:1], prefix):
             raise SystemExit(f"{family} did not return a finite chunk preserving the committed action.")
     host.begin_episode()
@@ -241,6 +246,7 @@ def rollout_joint_policy(host, identity, args):
                         gripper_tolerance=MOLMOACT2_GRIPPER_TOLERANCE if family == "molmoact2" else 0.05,
                         trace=rollout["RolloutTrace"](recording, recording_start, host.session),
                         committed_actions=args.committed_actions, stream_observations=family == "longwam",
+                        noise_seed=args.noise_seed,
                     )
                 finally:
                     env.close()
@@ -362,7 +368,7 @@ def soak_endpoint(host, identity, args):
                         call_started = time.monotonic()
                         try:
                             images = {role: camera.read()[0] for role, camera in cameras.items()}
-                            result = host.act(images, state, instruction=args.instruction)
+                            result = host.act(images, state, instruction=args.instruction, noise_seed=args.noise_seed)
                             elapsed_ms = (time.monotonic() - call_started) * 1000.0
                             telemetry = result.get("telemetry") or {}
                             server_latency = telemetry.get("server_infer_ms")
@@ -491,7 +497,7 @@ def main():
     from omegaconf import OmegaConf
     from orchestral_session_bridge import (
         GR00T_YAM_ADAPTER, TEMPORAL_JOINT_ADAPTER, TOOL_POSE_ADAPTER, TOOL_POSE_MATRIX_ADAPTER,
-        OrchestralSessionHost,
+        OrchestralSessionHost, parse_noise_seed,
     )
 
     parser = argparse.ArgumentParser(description="Run or probe a staging holesaw policy.")
@@ -500,6 +506,7 @@ def main():
     parser.add_argument("--probe", action="store_true", help="Test inference using synthetic observations")
     parser.add_argument("--soak-hours", type=float, default=0.0,
                         help="Run a robot-free live-camera endpoint soak for this many hours")
+    parser.add_argument("--noise-seed", type=parse_noise_seed, help="Fixed noise seed for each prediction")
     target, rollout_args = parser.parse_known_args()
     if not math.isfinite(target.soak_hours) or target.soak_hours < 0:
         parser.error("--soak-hours must be finite and nonnegative")
@@ -515,6 +522,8 @@ def main():
             family = "generic"
         else:
             parser.error(f"{target.deployment} has no YAM joint-rollout adapter for model {model_id!r}")
+    if target.noise_seed is not None and family not in NOISE_SEED_FAMILIES:
+        parser.error(f"{family} does not support --noise-seed")
 
     if family == "pi05" and not target.probe and target.soak_hours <= 0:
         sys.argv = [
@@ -525,6 +534,7 @@ def main():
             "--active-arm-side", "left",
             "--control-hz", "15",
             "--seconds", "300",
+            *([] if target.noise_seed is None else ["--noise-seed", str(target.noise_seed)]),
             *rollout_args,
         ]
         runpy.run_path(sys.argv[0], run_name="__main__")
@@ -550,6 +560,7 @@ def main():
     args.deployment = target.deployment
     args.soak_hours = target.soak_hours
     args.policy_family = family
+    args.noise_seed = target.noise_seed
     if not math.isfinite(args.seconds) or args.seconds <= 0:
         settings.error("--seconds must be positive and finite")
     if args.control_hz is not None and (not math.isfinite(args.control_hz) or args.control_hz < 1):
@@ -584,7 +595,7 @@ def main():
     try:
         identity = host.open()
         if target.soak_hours <= 0:
-            probe(host, family, args.instruction, committed_actions=args.committed_actions)
+            probe(host, family, args.instruction, committed_actions=args.committed_actions, noise_seed=args.noise_seed)
         if not target.probe:
             if args.soak_hours > 0:
                 soak_endpoint(host, identity, args)
