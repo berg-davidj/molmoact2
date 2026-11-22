@@ -17,7 +17,6 @@ import rerun as rr
 import rerun.blueprint as rrb
 
 from chunk_fusion import MODES as CHUNK_FUSION_MODES, ChunkPlan
-from launch_yaml_eval_molmoact import _build_env, resolve_bimanual_execution_mask, validate_bimanual_model_arm_order
 
 CAMERAS = {"belt": "front_camera_rgb", "wrist": "left_camera_rgb"}
 CONTROL_HZ = 15  # training rate of the YAM checkpoints; one action per 15 Hz step
@@ -38,7 +37,7 @@ def frames_for_policy(obs, camera_shapes, camera_bindings=CAMERAS):
 def checked_chunk(session, cameras, state, instruction, *, episode_start, action_shape=ACTION_SHAPE,
                   model_label="GR00T", gripper_tolerance=0.05, pose_actions=None, matrix_policy=False,
                   observation_time=None, max_plan_rows=None, history_inputs=None, trace=None, prediction_id=0,
-                  state_padding=None):
+                  state_padding=None, committed_actions=None):
     start = time.monotonic()
     query_state = pose_actions.state(state, matrix_policy=matrix_policy) if pose_actions else state
     if state_padding is not None:
@@ -49,6 +48,12 @@ def checked_chunk(session, cameras, state, instruction, *, episode_start, action
     if history_inputs is not None:
         sensors.update(history_inputs)
         query_state = None
+    if committed_actions is not None:
+        if state_padding is not None:
+            # The inactive half of the model has the same fixed command as its input state.
+            parked = np.broadcast_to(state_padding, (len(committed_actions), len(state_padding)))
+            committed_actions = np.concatenate([committed_actions, parked], axis=1)
+        sensors["committed_actions"] = committed_actions
     response = session.predict(cameras=cameras, state=query_state, instruction=instruction,
                                episode_start=episode_start, **sensors)
     chunk = np.asarray(response.actions, dtype=np.float32)
@@ -56,6 +61,8 @@ def checked_chunk(session, cameras, state, instruction, *, episode_start, action
         trace.prediction(prediction_id, response, chunk, session, time.monotonic() - start)
     if chunk.shape != action_shape or not np.isfinite(chunk).all():
         raise ValueError(f"{model_label} returned an invalid action chunk")
+    if committed_actions is not None and not np.array_equal(chunk[:len(committed_actions)], committed_actions):
+        raise ValueError(f"{model_label} did not preserve the committed action prefix")
     chunk = chunk[:max_plan_rows]
     if state_padding is not None:
         chunk = chunk[:, :len(state)]
@@ -92,7 +99,10 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
         camera_bindings=CAMERAS, history_offsets=(-3, 0), control_hz=CONTROL_HZ,
         action_shape=ACTION_SHAPE, model_label="GR00T", gripper_tolerance=0.05, pose_actions=None, matrix_policy=False,
         timestamp_observations=False, max_plan_rows=None, temporal_history=None, trace=None,
-        state_padding=None, chunk_fusion="splice", fusion_rows=4):
+        state_padding=None, chunk_fusion="splice", fusion_rows=4, committed_actions=False,
+        stream_observations=False):
+    if committed_actions and (chunk_fusion != "splice" or lead_steps < 1):
+        raise ValueError("Committed actions require splice and at least one prefetch lead step")
     period = 1 / control_hz
     history_size = 1 - min(history_offsets, default=0)
     history = deque(maxlen=history_size)
@@ -102,6 +112,8 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
     active_prediction = 0
     submitted_with = 0
     request_hold_ticks = 0
+    request_prefix_changed = False
+    observations = deque()
     rejected_chunks = 0
     rows = predictions = handoffs = misses = holds = 0
     next_tick = time.monotonic()
@@ -110,6 +122,8 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
     predictor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"{model_label.lower()}-predict")
     try:
         while time.monotonic() < deadline:
+            while observations and observations[0].done():
+                observations.popleft().result()
             obs = env.get_obs()
             observation_time = time.monotonic() - started_at if timestamp_observations else None
             frames = frames_for_policy(obs, session.grant.io_spec.cameras, camera_bindings)
@@ -132,12 +146,14 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 # A missed deadline invalidates a prefetched plan. Wait for a fresh
                 # observation instead of applying a plan computed before the hold.
                 missed = bool(submitted_with and request_hold_ticks)
-                first_row = None if missed else pending.add(chunk, request_slot)
+                first_row = None if missed or request_prefix_changed else pending.add(chunk, request_slot)
                 if trace is not None:
                     if not len(chunk):
                         trace.event(f"Prediction {predictions} rejected: unreachable plan")
                     elif missed:
                         trace.event(f"Prediction {predictions} dropped after {request_hold_ticks} hold ticks")
+                    elif request_prefix_changed:
+                        trace.event(f"Prediction {predictions} dropped after the safety mask changed a committed target")
                     elif first_row is None:
                         trace.event(f"Prediction {predictions} dropped: every row was stale")
                     else:
@@ -167,6 +183,8 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 submitted_with = len(pending)
                 request_slot = pending.slot
                 request_hold_ticks = 0
+                request_prefix_changed = False
+                prefix = pending.committed_actions() if committed_actions and submitted_with else None
                 if trace is not None:
                     trace.event(f"Prediction {predictions + 1} requested with {submitted_with} queued rows")
                 future = predictor.submit(checked_chunk, session, cameras, measured[:7].copy(),
@@ -176,8 +194,13 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                                           matrix_policy=matrix_policy, observation_time=observation_time,
                                           max_plan_rows=max_plan_rows, history_inputs=history_inputs,
                                           trace=trace, prediction_id=predictions + 1,
-                                          state_padding=state_padding)
+                                          state_padding=state_padding, committed_actions=prefix)
                 predictions += 1
+            elif stream_observations:
+                # Use the prediction executor to preserve Session order without blocking the control tick.
+                observations.append(predictor.submit(
+                    session.observe, cameras=frames, state=measured[:7].copy(), instruction=instruction,
+                ))
 
             next_tick += period
             row = command = row_index = None
@@ -189,6 +212,10 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                     target[:7] = row
                     command = mask.command_target(target, measured)
                     env.step_command_only(command, wait=False)
+                    if committed_actions and future is not None and submitted_with:
+                        # The hardware limit takes precedence. Replan from fresh feedback if a conditioned
+                        # target had to change, instead of applying a suffix based on a different command.
+                        request_prefix_changed |= not np.allclose(command[:7], row, rtol=0, atol=1e-6)
                     if temporal_history is not None:
                         temporal_history.commanded(command[:7])
                 rows += 1
@@ -311,6 +338,8 @@ def record_blueprint(camera_bindings, *, control_trace=False):
 
 
 def main():
+    from launch_yaml_eval_molmoact import _build_env, resolve_bimanual_execution_mask, validate_bimanual_model_arm_order
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--orchestral-grant", type=Path, required=True)
     parser.add_argument("--config-path", required=True)

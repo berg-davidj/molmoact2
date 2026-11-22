@@ -15,8 +15,8 @@ number of rows to commit. If a prediction is late, the arm holds the last commit
             chunking.observe(inputs=...)   # predicted in the background
         time.sleep(max(0.0, chunking.t_next - session.clock.now()))
 
-It needs a deployment that supports committed actions: the pi0.5 red-cap checkpoint
-(``npow/pi05-yam-red-cap-full-7500``, 15 x 7 actions at 15 Hz) does; MolmoAct2 does not yet. The
+It needs a deployment that supports committed actions, such as the pi0.5 red-cap checkpoint
+(``npow/pi05-yam-red-cap-full-7500``, 15 x 7 actions at 15 Hz). The
 rig, cameras, safety mask and rest-pose return are the launcher's own; only the control loop is new.
 
     PYTHONPATH=examples/yam python examples/yam/rtc_rollout.py \\

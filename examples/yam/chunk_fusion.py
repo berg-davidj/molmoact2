@@ -86,6 +86,10 @@ class ChunkPlan:
         self._sent.append(row[:-1])
         return index, row
 
+    def committed_actions(self):
+        """Snapshot the queued robot targets in execution order."""
+        return np.stack([row for _, row in self._queue])
+
     def add(self, chunk, first_slot):
         """Fuse a chunk whose row 0 targets `first_slot`. Returns the first row index used,
         or None when every row is stale."""

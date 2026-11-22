@@ -307,10 +307,23 @@ prediction delay and commits the rows the arm will run during that time. The nex
 chunk continues after the committed rows. If the prediction misses that boundary,
 the arm holds the last target until it arrives.
 
-It needs a deployment that supports committed actions, such as the pi0.5 red-cap
-checkpoint (15 × 7 at 15 Hz); MolmoAct2 does not yet. It uses the launcher's rig
-configs, camera checks, execution mask and rest-pose return, and an Orchestral SDK
-with `orchestral.RealTimeChunking`.
+For managed GR00T N1.7, Isaac 0.5, FLUX.3 Action, MolmoAct2, and Long-WAM, the
+YAM launcher commits queued robot commands by default with splice prefetch. It verifies that the
+Worker preserves a committed row before opening the motors. Use
+`--no-committed-actions` to run against an older Worker, or
+`--prefetch-lead-steps` to change how many rows it commits. Committed actions
+use splice handoffs. FLUX Workers serving the Holesaw checkpoint need
+`rtc_inference_max_prefix` set to at least the configured prefetch lead (four by
+default). Long-WAM also streams each intervening camera observation to its
+Worker, using an SDK with `Session.observe`.
+
+```bash
+examples/yam/run-rollout.sh --deployment <deployment-id> --probe
+```
+
+The standalone `rtc_rollout.py` example uses the pi0.5 red-cap checkpoint
+(15 × 7 at 15 Hz), the rig configs, camera checks, execution mask and rest-pose
+return, and an SDK with `orchestral.RealTimeChunking`.
 
 ```bash
 PYTHONPATH=examples/yam python examples/yam/rtc_rollout.py \

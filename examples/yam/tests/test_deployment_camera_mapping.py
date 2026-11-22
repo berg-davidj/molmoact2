@@ -11,6 +11,8 @@ import numpy as np
 import yaml
 from orchestral import IOSpec
 from orchestral_session_bridge import (
+    GR00T_YAM_ADAPTER,
+    TEMPORAL_JOINT_ADAPTER,
     OrchestralBridgeError,
     OrchestralSessionHost,
     _checkpoint_pixels,
@@ -18,6 +20,21 @@ from orchestral_session_bridge import (
 
 
 class DeploymentCameraMappingTests(unittest.TestCase):
+    def test_holesaw_exports_map_named_views(self):
+        layouts = [
+            (GR00T_YAM_ADAPTER, ("top_left", "wrist_left", "wrist_right")),
+            (GR00T_YAM_ADAPTER, ("belt", "wrist")),
+            (TEMPORAL_JOINT_ADAPTER, ("images.middle", "images.left")),
+            (TEMPORAL_JOINT_ADAPTER, ("images.middle", "images.left", "images.right")),
+            ("identity", ("observation.images.top", "observation.images.left_wrist")),
+        ]
+        for adapter, names in layouts:
+            with self.subTest(adapter=adapter, names=names):
+                host = OrchestralSessionHost(deployment_id="metadata-only", policy_adapter=adapter)
+                host._configure(IOSpec(cameras={name: (8, 8) for name in names}, state_dim=7, action_shape=(16, 7)))
+                self.assertEqual(host.identity["camera_mapping"], dict(zip(("top", "left", "right"), names)))
+                self.assertNotIn("history_rows", host.identity)
+
     def test_deployment_names_map_the_same_physical_views(self):
         layouts = [
             ("top", "left", "right"),

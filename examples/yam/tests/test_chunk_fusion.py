@@ -110,9 +110,23 @@ class _Session:
 
     grant = SimpleNamespace(io_spec=SimpleNamespace(cameras={"top": (4, 4)}))
 
-    def predict(self, *, cameras, state, instruction, episode_start):
+    def __init__(self):
+        self.requests = []
+        self.observations = []
+
+    def observe(self, *, cameras, state, instruction):
+        self.observations.append(cameras["top"][0, 0, 0])
+
+    def predict(self, *, cameras, state, instruction, episode_start, committed_actions=None, **sensors):
+        self.observe(cameras=cameras, state=state, instruction=instruction)
+        self.requests.append((episode_start, committed_actions, sensors))
         chunk = np.tile(np.asarray(state, dtype=np.float32), (16, 1))
         chunk[:, :6] += 0.01 * np.arange(16)[:, None]
+        if committed_actions is not None:
+            n = len(committed_actions)
+            chunk[:n] = committed_actions
+            chunk[n:] = committed_actions[-1]
+            chunk[n:, :6] += 0.01 * np.arange(1, len(chunk) - n + 1)[:, None]
         return SimpleNamespace(actions=chunk)
 
 
@@ -120,9 +134,12 @@ class _Env:
     def __init__(self):
         self.position = np.zeros(14, dtype=np.float32)
         self.commands = []
+        self.frame = 0
 
     def get_obs(self):
-        return {"joint_positions": self.position.copy(), "front_camera_rgb": np.zeros((4, 4, 3), np.uint8)}
+        frame = np.full((4, 4, 3), self.frame % 256, dtype=np.uint8)
+        self.frame += 1
+        return {"joint_positions": self.position.copy(), "front_camera_rgb": frame}
 
     def get_robot_state(self):
         return {"joint_positions": self.position.copy()}
@@ -170,3 +187,57 @@ def test_rollout_loop_commands_a_continuous_stream(mode, monkeypatch):
     assert len(commands) > 40
     steps = np.diff(commands[:, 0])
     assert steps.min() > -1e-4 and steps.max() < 0.03
+
+
+@pytest.mark.parametrize("bimanual,stateful", [(False, False), (True, False), (False, True)])
+def test_rollout_commits_the_queued_targets_before_appending_a_suffix(bimanual, stateful, monkeypatch):
+    groot_rollout = pytest.importorskip("groot_rollout")
+    monkeypatch.setattr(groot_rollout, "ThreadPoolExecutor", _InlinePredictor)
+    clock = iter(np.arange(0, 1000, 0.001))
+    monkeypatch.setattr(groot_rollout.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(groot_rollout.time, "sleep", lambda seconds: None)
+    env, session = _Env(), _Session()
+    parked = np.array([0, 0, 0, 0, 0, 0, 1], dtype=np.float32) if bimanual else None
+    groot_rollout.run(env, session, _Mask(), seconds=0.4, instruction="go", shadow=False,
+                      camera_bindings={"top": "front_camera_rgb"}, history_offsets=(), lead_steps=4,
+                      action_shape=(16, 14 if bimanual else 7), state_padding=parked,
+                      timestamp_observations=bimanual, committed_actions=True, stream_observations=stateful)
+    assert session.requests[0][:2] == (True, None)
+    _, prefix, sensors = session.requests[1]
+    assert len(prefix) == 4
+    np.testing.assert_array_equal(np.array(env.commands)[12:16], prefix[:, :7])
+    np.testing.assert_allclose(np.diff(np.array(env.commands)[:, 0]), 0.01, atol=1e-6)
+    if bimanual:
+        np.testing.assert_array_equal(prefix[:, 7:], np.tile(parked, (4, 1)))
+        assert sensors["timestamp"][0] > 0
+    if stateful:
+        assert session.observations == list(range(env.frame))
+
+
+def test_checked_chunk_rejects_changed_committed_rows():
+    groot_rollout = pytest.importorskip("groot_rollout")
+    session = SimpleNamespace(predict=lambda **kwargs: SimpleNamespace(actions=np.zeros((16, 7))))
+    with pytest.raises(ValueError, match="did not preserve the committed action prefix"):
+        groot_rollout.checked_chunk(session, {}, np.zeros(7), "go", episode_start=False,
+                                    committed_actions=np.ones((1, 7), np.float32))
+
+
+def test_rollout_replans_if_the_safety_mask_changes_a_committed_command(monkeypatch):
+    groot_rollout = pytest.importorskip("groot_rollout")
+    monkeypatch.setattr(groot_rollout, "ThreadPoolExecutor", _InlinePredictor)
+    clock = iter(np.arange(0, 1000, 0.001))
+    monkeypatch.setattr(groot_rollout.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(groot_rollout.time, "sleep", lambda seconds: None)
+    env, session = _Env(), _Session()
+
+    class ClipOnce(_Mask):
+        def command_target(self, target, measured):
+            if len(env.commands) == 12:
+                target[0] = measured[0]
+            return target
+
+    groot_rollout.run(env, session, ClipOnce(), seconds=0.3, instruction="go", shadow=False,
+                      camera_bindings={"top": "front_camera_rgb"}, history_offsets=(),
+                      lead_steps=4, committed_actions=True)
+    assert session.requests[1][1].shape == (4, 7)
+    assert session.requests[2][1] is None

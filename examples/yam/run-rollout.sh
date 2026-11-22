@@ -9,13 +9,18 @@ robot_python="${YAM_PYTHON:-$repo_dir/.venv/bin/python}"
 i2rt_dir="${I2RT_ROOT:-$repo_dir/../i2rt}"
 rtc_config=examples/yam/configs/pi05_red_lid_conveyor_left.yaml
 rtc_sdk_dir="${ORCHESTRAL_RTC_SDK_ROOT:-}"
+if [[ -n "$rtc_sdk_dir" && -d "$rtc_sdk_dir/src/orchestral" ]]; then
+  rtc_sdk_dir="$(realpath -- "$rtc_sdk_dir")/src"
+else
+  rtc_sdk_dir=""
+fi
 
 # Managed deployments need staging credentials and a DNS override on Thor.
 # Keep this path in the same launcher so local Worker usage stays unchanged.
 managed=0
 for arg in "$@"; do
   case "$arg" in
-    --deployment|--orchestral-deployment|--soak-hours|--probe) managed=1 ;;
+    --deployment|--deployment=*|--orchestral-deployment|--orchestral-deployment=*|--soak-hours|--soak-hours=*|--probe) managed=1 ;;
   esac
 done
 if [[ "$managed" -eq 1 ]]; then
@@ -27,17 +32,17 @@ if [[ "$managed" -eq 1 ]]; then
   exec sudo -n unshare --mount -- bash -c '
     set -euo pipefail
     mount --bind "$1" "$(readlink -f /etc/resolv.conf)"
-    repo="$2"; user_name="$3"; python="$4"; i2rt="$5"; credentials="$6"; shift 6
+    repo="$2"; user_name="$3"; python="$4"; i2rt="$5"; credentials="$6"; sdk="$7"; shift 7
     exec runuser -u "$user_name" -- env \
       -u ORC_BASE_URL -u ORC_API_KEY \
       ORCHESTRAL_BRIDGE_IPV4=1 \
       ORC_CREDENTIALS_FILE="$credentials" \
-      PYTHONPATH="$repo/examples/yam:$i2rt${PYTHONPATH:+:$PYTHONPATH}" \
+      PYTHONPATH="$repo/examples/yam:$i2rt${sdk:+:$sdk}${PYTHONPATH:+:$PYTHONPATH}" \
       "$python" -u "$repo/examples/yam/managed_rollout.py" "$@"
   ' bash \
     "$repo_dir/examples/yam/orchestral-stage-resolv.conf" \
     "$repo_dir" "$(id -un)" "$robot_python" "$i2rt_dir" \
-    "${ORC_CREDENTIALS_FILE:-$HOME/.orchestral/stage.json}" "$@"
+    "${ORC_CREDENTIALS_FILE:-$HOME/.orchestral/stage.json}" "$rtc_sdk_dir" "$@"
 fi
 
 if [[ ! -x "$robot_python" ]]; then
@@ -45,9 +50,8 @@ if [[ ! -x "$robot_python" ]]; then
   exit 1
 fi
 
-if [[ -n "$rtc_sdk_dir" && -d "$rtc_sdk_dir/src/orchestral" ]]; then
-  rtc_sdk_dir="$(realpath -- "$rtc_sdk_dir")"
-  export PYTHONPATH="$rtc_sdk_dir/src${PYTHONPATH:+:$PYTHONPATH}"
+if [[ -n "$rtc_sdk_dir" ]]; then
+  export PYTHONPATH="$rtc_sdk_dir${PYTHONPATH:+:$PYTHONPATH}"
 fi
 
 # The model is read from the Worker grant (policy_family.py); --gr00t is accepted but not needed.

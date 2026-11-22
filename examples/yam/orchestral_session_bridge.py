@@ -31,6 +31,7 @@ ACTION_SPACE = "joint_position"
 TOOL_POSE_ADAPTER = "tool_pose_rot6d"
 TOOL_POSE_MATRIX_ADAPTER = "tool_pose_matrix"
 TEMPORAL_JOINT_ADAPTER = "temporal_joint"
+GR00T_YAM_ADAPTER = "gr00t_yam"
 NOISE_SCHEME = "numpy-pcg64-15x32-fp32-v1"
 
 #: Environment variable naming a Python >= 3.12 interpreter that can import the
@@ -203,9 +204,14 @@ def _pixels(value: Any) -> Any:
     return np.asarray(value, dtype=np.uint8)
 
 
-def _camera_role(name: str) -> Optional[str]:
+def _camera_role(name: str, policy_adapter: str = "identity") -> Optional[str]:
     """Resolve a named view to this rig's physical camera, never by input order."""
     terminal = re.split(r"[./]", name)[-1].lower()
+    if policy_adapter == GR00T_YAM_ADAPTER:
+        # The GR00T export calls the overhead view "top_left"; the older YAM export calls it "belt".
+        known = {"top_left": "top", "belt": "top", "wrist": "left"}
+        if terminal in known:
+            return known[terminal]
     tokens = set(re.split(r"[_\-]+", terminal))
     # Camera names carry namespaces, view labels, stream numbers and encodings.
     # Only interpret known view vocabulary: e.g. exterior_image_0_left is not
@@ -271,7 +277,7 @@ def _checkpoint_input_names(
         return {"top": "exterior", "left": "wrist"}, states[0]
     cameras: Dict[str, str] = {}
     for key in CAMERA_KEYS:
-        matches = [name for name in images if _camera_role(name) == key]
+        matches = [name for name in images if _camera_role(name, policy_adapter) == key]
         if not matches and (allow_camera_subset or single_arm and key in ("left", "right")):
             continue
         if len(matches) != 1:
@@ -438,7 +444,8 @@ class OrchestralSessionHost:
             raise OrchestralBridgeError("a managed Orchestral deployment id is required")
         if observation_encoding not in OBSERVATION_ENCODINGS:
             raise OrchestralBridgeError(f"unsupported observation encoding: {observation_encoding!r}")
-        if policy_adapter not in {"identity", "pi05_yam_red_cap", TOOL_POSE_ADAPTER, TOOL_POSE_MATRIX_ADAPTER, TEMPORAL_JOINT_ADAPTER}:
+        if policy_adapter not in {"identity", "pi05_yam_red_cap", TOOL_POSE_ADAPTER, TOOL_POSE_MATRIX_ADAPTER,
+                                   TEMPORAL_JOINT_ADAPTER, GR00T_YAM_ADAPTER}:
             raise OrchestralBridgeError(f"unsupported policy_adapter: {policy_adapter!r}")
         self.policy_adapter = policy_adapter
         self.allow_camera_subset = allow_camera_subset
@@ -507,7 +514,7 @@ class OrchestralSessionHost:
     def _configure(self, spec):
         from types import SimpleNamespace
         history = getattr(spec, "camera_history", {}) or {}
-        if self.policy_adapter == TEMPORAL_JOINT_ADAPTER:
+        if self.policy_adapter == TEMPORAL_JOINT_ADAPTER and history:
             mapping = {"top": "images.scene", "left": "images.wrist"}
             names = set(mapping.values())
             rows = len(history.get("images.scene", ()))
