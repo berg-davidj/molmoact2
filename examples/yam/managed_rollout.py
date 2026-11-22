@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from chunk_fusion import MODES as CHUNK_FUSION_MODES
 from orchestral import Orchestral
 from orchestral.core.tailnet import ManagedTailnetNode, TailscaleCli
 
@@ -209,6 +210,7 @@ def rollout_joint_policy(host, identity, args):
                         # Isaac is conditioned on time since the episode began.
                         timestamp_observations=family in {"verne", "isaac05"}, max_plan_rows=plan_rows,
                         temporal_history=temporal_history,
+                        chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows,
                         state_padding=ISAAC_PARKED_RIGHT_ARM if bimanual_layout else None,
                         gripper_tolerance=MOLMOACT2_GRIPPER_TOLERANCE if family == "molmoact2" else 0.05,
                         trace=rollout["RolloutTrace"](recording, recording_start, host.session),
@@ -507,6 +509,10 @@ def main():
     settings.add_argument("--control-hz", type=float)
     settings.add_argument("--instruction", default=OmegaConf.load(LEFT_CONFIG).storage.language_instruction)
     settings.add_argument("--prefetch-lead-steps", type=int, default=0 if family in {"verne", "flux3-action"} else 8)
+    # How successive action chunks are joined; chunk_fusion.py describes each mode.
+    settings.add_argument("--chunk-fusion", choices=CHUNK_FUSION_MODES, default="splice")
+    settings.add_argument("--fusion-rows", type=int, default=4,
+                          help="Ticks over which crossfade and rail move onto a new chunk")
     settings.add_argument("--shadow", action="store_true")
     settings.add_argument("--rrd", type=Path, help="Rerun output path; opt in for soak runs")
     settings.add_argument("--metrics", type=Path, help="Soak CSV path (default: yam_eval_runs/soak/gr00t_soak_<timestamp>.metrics.csv)")
@@ -522,6 +528,8 @@ def main():
         settings.error("--soak-hours must be finite and nonnegative")
     if not 0 <= args.prefetch_lead_steps < 16:
         settings.error("--prefetch-lead-steps must be between 0 and 15")
+    if args.fusion_rows < 1:
+        settings.error("--fusion-rows must be at least 1")
     if family == "verne" and not (target.probe or target.soak_hours > 0 or args.shadow):
         settings.error("Verne hardware rollout is disabled after unexpected motion; use --shadow to test its policy without sending joint commands")
     if family == "flux3-action" and target.soak_hours > 0 and not target.probe:

@@ -16,6 +16,7 @@ from orchestral import ConnectGrant, Session
 import rerun as rr
 import rerun.blueprint as rrb
 
+from chunk_fusion import MODES as CHUNK_FUSION_MODES, ChunkPlan
 from launch_yaml_eval_molmoact import _build_env, resolve_bimanual_execution_mask, validate_bimanual_model_arm_order
 
 CAMERAS = {"belt": "front_camera_rgb", "wrist": "left_camera_rgb"}
@@ -91,11 +92,12 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
         camera_bindings=CAMERAS, history_offsets=(-3, 0), control_hz=CONTROL_HZ,
         action_shape=ACTION_SHAPE, model_label="GR00T", gripper_tolerance=0.05, pose_actions=None, matrix_policy=False,
         timestamp_observations=False, max_plan_rows=None, temporal_history=None, trace=None,
-        state_padding=None):
+        state_padding=None, chunk_fusion="splice", fusion_rows=4):
     period = 1 / control_hz
     history_size = 1 - min(history_offsets, default=0)
     history = deque(maxlen=history_size)
-    pending = deque()
+    pending = ChunkPlan(chunk_fusion, blend_rows=fusion_rows)
+    request_slot = 0
     future = None
     active_prediction = 0
     submitted_with = 0
@@ -115,7 +117,9 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
             measured = mask.validate_state(obs["joint_positions"], name="policy input state")
             if temporal_history is not None:
                 temporal_history.observe(frames, measured[:7])
-            if not pending and future is not None and future.done():
+            # A fusing plan takes each chunk as it arrives and blends it into the queued rows.
+            # A splicing plan waits until the queued rows have run out.
+            if future is not None and future.done() and (pending.fuses or not pending):
                 try:
                     chunk, elapsed = future.result()
                 except Exception as error:
@@ -123,29 +127,32 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                         trace.event(f"Prediction {predictions} failed: {error}")
                     raise
                 future = None
+                # Each command sent since the request corresponds to one row of the new
+                # plan, which starts at the observation taken for this prediction.
+                # A missed deadline invalidates a prefetched plan. Wait for a fresh
+                # observation instead of applying a plan computed before the hold.
+                missed = bool(submitted_with and request_hold_ticks)
+                first_row = None if missed else pending.add(chunk, request_slot)
                 if trace is not None:
                     if not len(chunk):
                         trace.event(f"Prediction {predictions} rejected: unreachable plan")
-                    elif submitted_with and request_hold_ticks:
+                    elif missed:
                         trace.event(f"Prediction {predictions} dropped after {request_hold_ticks} hold ticks")
+                    elif first_row is None:
+                        trace.event(f"Prediction {predictions} dropped: every row was stale")
                     else:
-                        trace.event(f"Prediction {predictions} accepted starting at row {submitted_with}")
+                        trace.event(f"Prediction {predictions} accepted starting at row {first_row}")
                 if len(chunk):
                     rejected_chunks = 0
                 else:
                     rejected_chunks += 1
                     if rejected_chunks == 3:
                         raise SystemExit(f"{model_label} returned three consecutive unreachable plans; rollout stopped")
-                # Each elapsed command in the active plan corresponds to one row in the
-                # new plan, which starts at the observation taken for this prediction.
-                # A missed deadline invalidates a prefetched plan. Wait for a fresh
-                # observation instead of applying a plan computed before the hold.
-                if submitted_with and request_hold_ticks:
+                if missed:
                     misses += 1
                     print(f"[{model_label.lower()}] Prefetch missed the boundary ({elapsed * 1000:.0f} ms). "
                           "Replanning.", flush=True)
-                else:
-                    pending.extend(enumerate(chunk[submitted_with:], start=submitted_with))
+                elif first_row is not None:
                     active_prediction = predictions
                     handoffs += bool(submitted_with)
             if len(history) == history_size and future is None and len(pending) <= lead_steps:
@@ -158,6 +165,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 if temporal_history is not None:
                     cameras, history_inputs = temporal_history.inputs()
                 submitted_with = len(pending)
+                request_slot = pending.slot
                 request_hold_ticks = 0
                 if trace is not None:
                     trace.event(f"Prediction {predictions + 1} requested with {submitted_with} queued rows")
@@ -174,7 +182,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
             next_tick += period
             row = command = row_index = None
             if pending and time.monotonic() < deadline:
-                row_index, row = pending.popleft()
+                row_index, row = pending.pop()
                 if not shadow:
                     measured = mask.validate_state(env.get_robot_state()["joint_positions"], name="measured state")
                     target = measured.copy()
@@ -310,6 +318,10 @@ def main():
     parser.add_argument("--seconds", type=float, default=30.0)
     parser.add_argument("--instruction", default="Pick up the red lid from the conveyor belt.")
     parser.add_argument("--prefetch-lead-steps", type=int, default=8)
+    parser.add_argument("--chunk-fusion", choices=CHUNK_FUSION_MODES, default="splice",
+                        help="How successive action chunks are joined (see chunk_fusion.py)")
+    parser.add_argument("--fusion-rows", type=int, default=4,
+                        help="Ticks over which crossfade and rail move onto a new chunk")
     parser.add_argument("--rrd", type=Path, help="Rerun recording path (default: yam_eval_runs/rerun/gr00t_<timestamp>.rrd)")
     parser.add_argument("--shadow", action="store_true", help="Read cameras and feedback without sending policy commands.")
     args = parser.parse_args()
@@ -317,6 +329,8 @@ def main():
         parser.error("--seconds must be positive and finite")
     if not 0 <= args.prefetch_lead_steps < ACTION_SHAPE[0]:
         parser.error("--prefetch-lead-steps must be between 0 and 15")
+    if args.fusion_rows < 1:
+        parser.error("--fusion-rows must be at least 1")
     if not args.orchestral_grant.is_file():
         parser.error(f"local GR00T Worker Grant is missing at {args.orchestral_grant}")
     if args.orchestral_grant.stat().st_mode & 0o077:
@@ -379,6 +393,7 @@ def main():
                 try:
                     run(env, session, mask, seconds=args.seconds, instruction=args.instruction, shadow=args.shadow,
                         lead_steps=args.prefetch_lead_steps,
+                        chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows,
                         trace=RolloutTrace(recording, recording_start, session))
                 finally:
                     env.close()
