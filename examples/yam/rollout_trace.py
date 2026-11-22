@@ -8,16 +8,18 @@ import rerun as rr
 class RolloutTrace:
     """Record policy responses and control ticks on the camera timeline."""
 
-    def __init__(self, recording, start_time, session):
+    def __init__(self, recording, start_time, session, *, active_arm_side="left"):
         self.recording = recording
         self.start_time = start_time
         self._response_lock = threading.Lock()
         self._stopped = False
+        self._plan_path = f"/robot/planned_{active_arm_side}"
         names = [f"{arm} joint {joint}" if joint < 7 else f"{arm} aperture"
                  for arm in ("left", "right") for joint in range(1, 8)]
         for path in ("measured", "command_sent"):
             recording.log(f"/robot/{path}", rr.SeriesLines(names=names), static=True)
-        recording.log("/robot/planned_left", rr.SeriesLines(names=names[:7]), static=True)
+        arm_names = names[:7] if active_arm_side == "left" else names[7:]
+        recording.log(self._plan_path, rr.SeriesLines(names=arm_names), static=True)
         encoder = getattr(session, "encoder_label", None) or getattr(session, "encoder", "unknown")
         recording.log("/policy/encoder", rr.TextDocument(str(encoder)), static=True)
 
@@ -53,7 +55,7 @@ class RolloutTrace:
         self.recording.log("/robot/measured", rr.Scalars(measured))
         self.recording.log("/policy/holding", rr.Scalars(int(holding)))
         if row is not None:
-            self.recording.log("/robot/planned_left", rr.Scalars(row),
+            self.recording.log(self._plan_path, rr.Scalars(row),
                                rr.AnyValues(prediction_id=prediction_id, row_index=row_index))
         if command is not None:
             self.recording.log("/robot/command_sent", rr.Scalars(command),

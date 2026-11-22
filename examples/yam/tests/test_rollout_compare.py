@@ -192,6 +192,31 @@ def test_recordings_written_by_the_rollout_trace_are_ranked(tmp_path, monkeypatc
     assert json.loads(rollout_compare.sidecar_path(shadow).read_text())["settings"]["execution_mode"] == "shadow"
 
 
+def test_right_arm_trace_scores_the_right_arm(tmp_path, monkeypatch):
+    rr = pytest.importorskip("rerun")
+    import rollout_trace
+    from rollout_trace_report import report
+
+    clock = [0.0]
+    monkeypatch.setattr(rollout_trace.time, "monotonic", lambda: clock[0])
+    path = tmp_path / "right.rrd"
+    recording = rr.RecordingStream("test")
+    recording.save(path)
+    trace = rollout_trace.RolloutTrace(recording, 0.0, SimpleNamespace(), active_arm_side="right")
+    times, plan = ramp(40)
+    for tick, (measured, target) in enumerate(zip(following(plan), plan)):
+        clock[0] = times[tick]
+        trace.tick(np.concatenate([np.zeros(7), measured]), target,
+                   np.concatenate([np.zeros(7), target]), tick // 8, tick % 8, holding=False)
+    trace.stop()
+    recording.disconnect()
+
+    measures = rollout_compare.measure_recording(path, shadow=False)
+    assert measures["tracking"] == pytest.approx(0.0, abs=1e-6)
+    assert measures["capped"] == 0.0
+    assert "capped ticks       0%" in report(path)
+
+
 def test_grasps_are_counted_whichever_way_the_gripper_closes():
     cycle = np.concatenate([np.full(10, 0.9), np.full(10, 0.1)])
     assert rollout_compare.count_grasps(np.tile(cycle, 3)) == 2  # closed three times, reopened twice

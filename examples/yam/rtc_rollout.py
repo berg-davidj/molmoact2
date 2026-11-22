@@ -269,8 +269,9 @@ def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_i
             raise SystemExit(f"--chunk-fusion {chunk_fusion} needs a single-arm ({ARM_DIM}-wide) endpoint: "
                              "the fusion treats only the last column as a gripper")
         fusion = RtcChunkFusion(chunk_fusion, fusion_rows, host.robot_actions)
+    active_arm = slice(0, ARM_DIM) if mask.active_arm_side == "left" else slice(ARM_DIM, 2 * ARM_DIM)
     if endpoint_dim == ARM_DIM:
-        endpoint = slice(0, ARM_DIM) if mask.active_arm_side == "left" else slice(ARM_DIM, 2 * ARM_DIM)
+        endpoint = active_arm
     else:
         endpoint = slice(0, endpoint_dim)
     red_cap = host.policy_adapter == "pi05_yam_red_cap"
@@ -280,8 +281,10 @@ def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_i
     if trace is not None:
         # The chunk as absolute targets and how long it took, for rollout_compare.py.
         def record_prediction(chunk):
-            trace.prediction(chunk.seq, None, host.robot_actions(chunk.actions, chunk.meta["query_state"]),
-                             session, chunk.t_completed - chunk.t_sent)
+            actions = host.robot_actions(chunk.actions, chunk.meta["query_state"])
+            if actions.shape[-1] == 2 * ARM_DIM:
+                actions = actions[:, active_arm]
+            trace.prediction(chunk.seq, None, actions, session, chunk.t_completed - chunk.t_sent)
     chunking = make_chunking(VerifiedCommittedSession(session), control_hz, s_min=s_min, d_init=d_init,
                              rebase_joints=6 if red_cap else 0, telemetry=telemetry, fusion=fusion,
                              record_prediction=record_prediction)
@@ -316,7 +319,6 @@ def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_i
             env.step_command_only(command, wait=False)
             sent += 1
             if trace is not None:
-                active_arm = slice(0, ARM_DIM) if mask.active_arm_side == "left" else slice(ARM_DIM, 2 * ARM_DIM)
                 trace.tick(measured, target[active_arm], command, chunk.seq, row_index, holding=False)
         if chunking.should_replan():
             meta = {}
@@ -500,11 +502,12 @@ def main(argv: Optional[list] = None) -> int:
                 policy_adapter=host.policy_adapter, control_hz=control_hz,
                 chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows, s_min=args.s_min,
                 d_init=args.d_init, max_prediction_failures=args.max_prediction_failures,
-                camera_fps=args.camera_fps, execution_mode=mask.execution_mode,
+                camera_fps=args.camera_fps, execution_mode=mask.execution_mode, active_arm_side=mask.active_arm_side,
                 seconds=args.seconds, noise_seed=args.noise_seed, instruction=instruction))
             recording = rr.RecordingStream("yam_rtc_rollout")
             recording.save(trace_path)
             logger.info("Recording the control trace to %s", trace_path)
+            trace = RolloutTrace(recording, time.monotonic(), host.session, active_arm_side=mask.active_arm_side)
             completed = True
             try:
                 summary = run(env, host, mask, control_hz=control_hz, instruction=instruction,
@@ -512,7 +515,7 @@ def main(argv: Optional[list] = None) -> int:
                               max_prediction_failures=args.max_prediction_failures, camera_frames=camera_frames,
                               noise_seed=args.noise_seed,
                               chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows,
-                              trace=RolloutTrace(recording, time.monotonic(), host.session))
+                              trace=trace)
                 logger.info("Rollout summary: %s", summary)
             except KeyboardInterrupt:
                 logger.info("Interrupted")
@@ -520,6 +523,7 @@ def main(argv: Optional[list] = None) -> int:
                 completed = False  # a fault holds and releases the arms; it never starts a new motion
                 raise
             finally:
+                trace.stop()
                 recording.disconnect()
                 if completed and eval_cfg.get("return_to_rest_on_exit", False):
                     return_to_captured_rest_pose(

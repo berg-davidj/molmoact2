@@ -43,7 +43,7 @@ JOINTS = slice(0, 6)
 # Settings that define a combination. Whichever of these differ between a deployment's runs
 # become the columns of its table; everything else (paths, seeds, durations) is ignored.
 TUNABLE = ("chunk_fusion", "fusion_rows", "prefetch_lead_steps", "committed_actions", "s_min", "d_init",
-           "control_hz", "camera_fps", "max_prediction_failures")
+           "control_hz", "camera_fps", "max_prediction_failures", "active_arm_side")
 MEASURES = ("shake", "tracking", "seam", "capped", "hold", "grasps", "latency", "age", "shift")
 # Fewer scored runs than this per combination and a ranking is not reported as decided.
 MIN_RUNS = 3
@@ -170,19 +170,19 @@ def measure_recording(path, *, shadow):
     """`motion_measures` of a recording's control trace, or None when it has no usable trace."""
     import warnings
 
-    from rollout_trace_report import load_trace
+    from rollout_trace_report import active_plan, load_trace
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # older recordings have no footer; they still read
         trace = load_trace(path)
-    planned = trace.get("/robot/planned_left", [])
+    planned, arm = active_plan(trace)
     measured = {row["elapsed"]: row["Scalars:scalars"] for row in trace.get("/robot/measured", [])}
     if len(planned) < 30 or any(row["elapsed"] not in measured for row in planned):
         return None
     commands = trace.get("/robot/command_sent", [])
     sent = None
     if not shadow and len(commands) == len(planned):
-        sent = [row["Scalars:scalars"] for row in commands]
+        sent = [row["Scalars:scalars"][arm] for row in commands]
     requested = {}
     for row in trace.get("/policy/events", []):
         if match := re.match(r"Prediction (\d+) requested", str(_unwrap(row["TextLog:text"]))):
@@ -194,7 +194,7 @@ def measure_recording(path, *, shadow):
             raw[_unwrap(row["prediction_id"])] = np.asarray(tensor["buffer"], dtype=np.float64).reshape(tensor["shape"])
     return motion_measures(
         [row["elapsed"] / 1e9 for row in planned],
-        [measured[row["elapsed"]] for row in planned],
+        [measured[row["elapsed"]][arm] for row in planned],
         [row["Scalars:scalars"] for row in planned],
         sent,
         [_unwrap(row["prediction_id"]) for row in planned],

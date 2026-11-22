@@ -42,9 +42,16 @@ def load_trace(path):
     return {entity: sorted(values, key=lambda row: row["elapsed"]) for entity, values in rows.items()}
 
 
+def active_plan(trace):
+    """Return the active arm's plan and its columns in the bimanual trace."""
+    if "/robot/planned_right" in trace:
+        return trace["/robot/planned_right"], slice(7, 14)
+    return trace.get("/robot/planned_left", []), slice(0, 7)
+
+
 def report(path):
     trace = load_trace(path)
-    planned = trace.get("/robot/planned_left", [])
+    planned, arm = active_plan(trace)
     if len(planned) < 30:
         return f"{path.name}: no control trace (fewer than 30 planned rows)"
     plan = np.array([row["Scalars:scalars"] for row in planned])
@@ -66,7 +73,7 @@ def report(path):
     ]
     commands = trace.get("/robot/command_sent", [])
     if len(commands) == len(plan):
-        sent = np.array([row["Scalars:scalars"] for row in commands])[:, :plan.shape[1]]
+        sent = np.array([row["Scalars:scalars"] for row in commands])[:, arm]
         capped = (np.abs(sent - plan)[:, JOINTS].max(axis=1) > 1e-4).mean()
         lines.append(f"  capped ticks       {100 * capped:.0f}% (the command differed from the plan)")
     else:
