@@ -71,6 +71,8 @@ class V4L2Camera:
         self._latest_rgb: Optional[np.ndarray] = None
         self._latest_depth: Optional[np.ndarray] = None
         self._latest_frame_timestamp: Optional[float] = None
+        # Capture time (time.time()) of the frame the last read() returned.
+        self.last_read_timestamp: Optional[float] = None
         self._last_capture_error: Optional[BaseException] = None
 
         self._capture_thread = threading.Thread(
@@ -149,6 +151,7 @@ class V4L2Camera:
                 raise RuntimeError(f"V4L2 camera {self.device} failed to capture a frame") from last_error
             raise RuntimeError(f"V4L2 camera {self.device} has no frame yet")
 
+        self.last_read_timestamp = timestamp
         age = time.time() - timestamp
         if age > self._max_frame_age_sec:
             raise RuntimeError(

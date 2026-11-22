@@ -95,7 +95,7 @@ class CameraServer:
             image, _depth = cam.read()
             frames[name] = image
             # Surface the capture timestamp so the client can detect staleness.
-            ts = getattr(cam, "_latest_frame_timestamp", None) or 0.0
+            ts = getattr(cam, "last_read_timestamp", None) or getattr(cam, "_latest_frame_timestamp", None) or 0.0
             timestamps[name] = float(ts)
         return {"ok": True, "frames": frames, "timestamps": timestamps}
 

@@ -38,6 +38,8 @@ class CameraClient:
         self.endpoint = endpoint
         self.request_timeout_ms = int(request_timeout_ms)
         self.max_frame_age_sec = max_frame_age_sec
+        # Capture time (time.time()) per camera of the frames the last get_obs() returned.
+        self.last_timestamps: Dict[str, float] = {}
         self._ctx = zmq.Context.instance()
         self._sock: Optional[zmq.Socket] = None
         self._connect()
@@ -83,6 +85,7 @@ class CameraClient:
         """Return ``{cam_name: np.ndarray (H,W,3) uint8 RGB}`` with the latest frames."""
         resp = self._request("obs")
         frames: Dict[str, np.ndarray] = resp["frames"]
+        self.last_timestamps = {name: float(ts) for name, ts in (resp.get("timestamps") or {}).items() if ts}
         if self.max_frame_age_sec is not None:
             now = time.time()
             for name, ts in (resp.get("timestamps") or {}).items():

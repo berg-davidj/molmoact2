@@ -31,6 +31,7 @@ Ctrl-C ends the rollout. Requires an Orchestral SDK (``orchestral-labs``) with
 from __future__ import annotations
 
 import argparse
+import inspect
 import logging
 import sys
 import time
@@ -50,6 +51,7 @@ from launch_yaml_eval_molmoact import (  # noqa: E402
     return_to_captured_rest_pose,
     validate_bimanual_model_arm_order,
 )
+from frame_capture_time import session_capture_time  # noqa: E402
 from orchestral_session_bridge import OrchestralDirectHost, OrchestralSessionHost  # noqa: E402
 
 logger = logging.getLogger("rtc_rollout")
@@ -83,6 +85,10 @@ class RolloutTelemetry:
             if "observation_prep_ms" in chunk.meta:
                 times["observation_prep_ms"] = chunk.meta["observation_prep_ms"]
                 times["client_queue_ms"] = 1000 * (chunk.t_sent - chunk.meta["queued_at"])
+            if chunk.meta.get("captured_at") is not None:
+                # Camera frame captured -> chunk back on the robot, both on the Session clock.
+                times["observation_to_action_ms"] = 1000 * (chunk.t_completed - chunk.meta["captured_at"])
+                times["frame_age_at_queue_ms"] = 1000 * (chunk.meta["queued_at"] - chunk.meta["captured_at"])
             if (timing := chunk.timings) is not None:
                 times.update(
                     client_encode_ms=timing.encode_us / 1000,
@@ -112,8 +118,9 @@ class RolloutTelemetry:
             completed, failed, dict(sorted(prefixes.items())), late_count, self.hold_ticks, self.period_ms,
         )
         for name, values in metrics.items():
-            median, p95 = np.percentile(values, (50, 95))
-            logger.info("RTC timing %s p50=%.1f p95=%.1f max=%.1f", name, median, p95, max(values))
+            median, p95, p99 = np.percentile(values, (50, 95, 99))
+            logger.info("RTC timing %s n=%d p50=%.1f p95=%.1f p99=%.1f max=%.1f",
+                        name, len(values), median, p95, p99, max(values))
 
 
 class VerifiedCommittedSession:
@@ -176,6 +183,9 @@ def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_i
     session = host.session
     chunking = make_chunking(VerifiedCommittedSession(session), control_hz, s_min=s_min, d_init=d_init,
                              rebase_joints=6 if red_cap else 0, telemetry=telemetry)
+    # An SDK that measures its control-loop latencies from the capture time takes it as
+    # `t_captured`; an older one does not know the argument, and it stays in `meta` only.
+    sdk_takes_capture_time = "t_captured" in inspect.signature(chunking.observations.put).parameters
     sent = 0
     deadline = session.clock.now() + seconds
     while session.clock.now() < deadline:
@@ -194,16 +204,23 @@ def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_i
         if chunking.should_replan():
             capture_started = session.clock.now()
             obs = env.get_obs()
+            captured_at = session_capture_time(env, session.clock)
             state = mask.validate_state(obs["joint_positions"], name="policy input state")[endpoint]
             images = {"top": obs["front_camera_rgb"], "left": obs["left_camera_rgb"],
                       "right": obs["right_camera_rgb"]}
             inputs, query_state = host.predict_inputs(images, state)
             queued_at = session.clock.now()
-            chunking.observe(inputs=inputs, instruction=instruction, meta={
+            meta = {
                 "query_state": query_state,
                 "observation_prep_ms": 1000 * (queued_at - capture_started),
                 "queued_at": queued_at,
-            })
+            }
+            capture_time = {}
+            if captured_at is not None:
+                meta["captured_at"] = captured_at
+                if sdk_takes_capture_time:
+                    capture_time["t_captured"] = captured_at
+            chunking.observe(inputs=inputs, instruction=instruction, meta=meta, **capture_time)
         time.sleep(max(0.0, chunking.t_next - session.clock.now()))
     return {"rows_sent": sent, "hold_ticks": telemetry.hold_ticks, "late_chunks": chunking.late,
             "delays_ticks": list(chunking.delays), "rows_run_before_takeover": list(chunking.k)}

@@ -43,6 +43,8 @@ class RealSenseCamera(CameraDriver):
         self._latest_color_image = None
         self._latest_depth_image = None
         self._latest_frame_timestamp = None
+        # Capture time (time.time()) of the frame the last read() returned.
+        self.last_read_timestamp = None
         self._last_capture_error = None
         self._frame_ready = threading.Event()
         self._stop_event = threading.Event()
@@ -152,6 +154,7 @@ class RealSenseCamera(CameraDriver):
                 raise RuntimeError("RealSense capture thread failed to produce a frame.") from last_error
             raise RuntimeError("RealSense frame is unavailable.")
 
+        self.last_read_timestamp = frame_timestamp
         frame_age = time.time() - frame_timestamp
         if frame_age > self._max_frame_age_sec:
             raise RuntimeError(

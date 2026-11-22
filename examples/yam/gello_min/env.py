@@ -33,6 +33,9 @@ class RobotEnv:
         # instead of opening RealSense devices in-process. camera_dict is
         # then ignored. See gello/cameras/camera_client.py.
         self._camera_client = camera_client
+        # Capture time (time.time()) per camera of the frames the last get_obs() returned.
+        # Empty when a camera does not report one.
+        self.last_frame_timestamps: Dict[str, float] = {}
 
     # dynamic offset is used in data collection to make sure the same
     # starting position between each episode.
@@ -117,14 +120,20 @@ class RobotEnv:
             obs: observation from the environment.
         """
         observations: Dict[str, Any] = {}
+        timestamps: Dict[str, float] = {}
         if self._camera_client is not None:
             frames = self._camera_client.get_obs()
             for name, image in frames.items():
                 observations[f"{name}_rgb"] = image
+            timestamps = dict(getattr(self._camera_client, "last_timestamps", None) or {})
         else:
             for name, camera in self._camera_dict.items():
                 image, _depth = camera.read()
                 observations[f"{name}_rgb"] = image
+                timestamp = getattr(camera, "last_read_timestamp", None)
+                if timestamp:
+                    timestamps[name] = float(timestamp)
+        self.last_frame_timestamps = timestamps
 
         observations.update(self.get_robot_state())
         return observations
