@@ -327,6 +327,11 @@ PYTHONPATH=examples/yam python examples/yam/rtc_rollout.py \
   are re-expressed from the previous query state to the new one before they are sent.
 - A failed prediction ends the rollout (the arm holds its last target). The summary
   logs rows sent, hold ticks, late chunks and measured delays.
+- The timing report at exit prints n, p50, p95, p99 and max per measure.
+  `observation_to_action_ms` runs from the capture of the oldest camera frame in an
+  observation to its chunk arriving back on the robot, both on the robot's clocks.
+  The capture time is when the frame was read from the driver, so sensor exposure
+  and driver buffering before that are not included.
 
 ### Metrics
 

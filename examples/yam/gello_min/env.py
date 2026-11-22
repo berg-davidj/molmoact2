@@ -128,9 +128,15 @@ class RobotEnv:
             timestamps = dict(getattr(self._camera_client, "last_timestamps", None) or {})
         else:
             for name, camera in self._camera_dict.items():
-                image, _depth = camera.read()
+                # Other threads (previews, recorders) read the same cameras, so the capture
+                # time has to come back with the frame, not from a shared attribute.
+                read_with_timestamp = getattr(camera, "read_with_timestamp", None)
+                if read_with_timestamp is not None:
+                    image, _depth, timestamp = read_with_timestamp()
+                else:
+                    image, _depth = camera.read()
+                    timestamp = None
                 observations[f"{name}_rgb"] = image
-                timestamp = getattr(camera, "last_read_timestamp", None)
                 if timestamp:
                     timestamps[name] = float(timestamp)
         self.last_frame_timestamps = timestamps
