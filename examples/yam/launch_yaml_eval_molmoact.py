@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from itertools import count
 from pathlib import Path
-from typing import Annotated, Any, Callable, Dict, List, Literal, Mapping, Optional, Tuple
+from typing import Annotated, Any, Callable, Collection, Dict, List, Literal, Mapping, Optional, Tuple
 
 import numpy as np
 import torch
@@ -779,6 +779,8 @@ def _build_env(
     *,
     camera_sources: Optional[Mapping[str, Mapping[str, Any]]] = None,
     camera_frame_callback: Optional[Callable[[str, np.ndarray, float], None]] = None,
+    camera_roles: Optional[Collection[str]] = None,
+    timed_camera_frame_callback: Optional[Callable[[str, np.ndarray, float, float | None], None]] = None,
 ) -> Tuple[RobotEnv, Dict[str, Any], Optional[Dict[str, Any]], bool]:
     """Build cameras + robot(s) + RobotEnv from the launch configs.
 
@@ -842,6 +844,9 @@ def _build_env(
             camera_dict = {}
             capture_descriptions = []
             for name, device in zip(camera_names, device_ids):
+                role = sensor_ids[name]
+                if camera_roles is not None and role not in camera_roles:
+                    continue
                 cfg = camera_cfg[name]
                 if not bool(cfg.get("enabled", True)):
                     camera_dict[name] = _DisabledCamera()
@@ -867,17 +872,25 @@ def _build_env(
                         f"Orchestral camera source {sensor_ids[name]!r} is incompatible "
                         f"with the YAM V4L2 RGB capture path: {native}"
                     )
-                fps = int(cfg.get("fps", source.get("capture_rate_hz", 5)))
+                camera_fps = getattr(args, "camera_fps", None) or {}
+                fps = int(camera_fps.get(role, cfg.get("fps", source.get("capture_rate_hz", 5))))
+                callbacks = {}
+                if camera_frame_callback is not None:
+                    callbacks["frame_callback"] = lambda frame, timestamp, camera=role: camera_frame_callback(
+                        camera, frame, timestamp,
+                    )
+                if timed_camera_frame_callback is not None:
+                    callbacks["timed_frame_callback"] = (
+                        lambda frame, ready_at, captured_at, camera=role: timed_camera_frame_callback(
+                            camera, frame, ready_at, captured_at,
+                        )
+                    )
                 camera_dict[name] = V4L2Camera(
                     device,
                     width=width,
                     height=height,
                     fps=fps,
-                    frame_callback=(
-                        (lambda frame, timestamp, camera=sensor_ids[name]:
-                         camera_frame_callback(camera, frame, timestamp))
-                        if camera_frame_callback is not None else None
-                    ),
+                    **callbacks,
                 )
                 capture_shapes[name] = (height, width, channels)
                 capture_descriptions.append(

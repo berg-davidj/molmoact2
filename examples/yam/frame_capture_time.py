@@ -12,6 +12,7 @@ clocks are read at the same moment.
 from __future__ import annotations
 
 import time
+from collections.abc import Iterable
 from typing import Any, Optional
 
 _BOOT_ID = "/proc/sys/kernel/random/boot_id"
@@ -31,22 +32,22 @@ def _session_clock_is_monotonic(clock: Any) -> bool:
     return abs(clock.to_source(clock.now()) - time.monotonic()) < 0.01
 
 
-def session_capture_time(env: Any, clock: Any) -> Optional[float]:
-    """Session time at which the oldest frame of the last ``env.get_obs()`` was captured.
+def session_capture_time(env: Any, clock: Any, *, camera_names: Iterable[str] | None = None) -> Optional[float]:
+    """Session capture time of the oldest selected frame from the last ``env.get_obs()``.
 
-    The oldest frame is used because an observation is only as fresh as its stalest camera.
-    None, so no figure rather than a wrong one, when any camera reported no capture time (the
-    oldest of the others would be too young), or when a wall-clock stamp is ahead of the wall
-    clock (the clock was set back since the capture).
+    Pass the cameras used by the prediction to measure the age of its oldest input frame.
+    With no selection, include all returned frames. Return None when a selected camera has
+    no capture time or the oldest wall-clock stamp is ahead of the wall clock.
     """
-    timestamps = getattr(env, "last_frame_timestamps", None)
-    if not timestamps or any(ts is None for ts in timestamps.values()):
+    timestamps = getattr(env, "last_frame_timestamps", None) or {}
+    names = tuple(timestamps if camera_names is None else camera_names)
+    if not names or any(timestamps.get(name) is None for name in names):
         return None
     monotonic = getattr(env, "last_frame_monotonic", None) or {}
-    if (set(monotonic) == set(timestamps) and all(m is not None for m in monotonic.values())
+    if (all(monotonic.get(name) is not None for name in names)
             and _session_clock_is_monotonic(clock)):
-        return clock.from_source(min(monotonic.values()))
-    age = time.time() - min(timestamps.values())
+        return clock.from_source(min(monotonic[name] for name in names))
+    age = time.time() - min(timestamps[name] for name in names)
     if age < 0:
         return None
     return clock.now() - age

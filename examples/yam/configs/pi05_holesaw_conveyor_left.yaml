@@ -9,6 +9,7 @@ sensors:
       width: 640
       height: 480
       fps: 30
+      rtc_fps: 90
     front_camera:
       device_id: "/dev/yam-cameras/middle"
       width: 640
@@ -30,5 +31,7 @@ storage:
   language_instruction: "Pick three hole saws from the moving conveyor belt and place them in the red case."
 
 eval:
+  # Keep the policy at 15 Hz while shortening the USB camera frame period.
+  rtc_camera_fps: 60
   server:
     policy_adapter: pi05_yam_red_cap

@@ -5,6 +5,7 @@ import numpy as np
 import frame_capture_time
 from frame_capture_time import session_capture_time
 from gello_min.env import RobotEnv
+from rtc_camera_frames import RtcCameraFrames, frame_times
 
 FRAME = np.zeros((2, 2, 3), dtype=np.uint8)
 DEPTH = np.zeros((2, 2, 1), dtype=np.uint16)
@@ -121,6 +122,48 @@ def test_capture_time_is_the_oldest_frame_on_the_session_clock(monkeypatch):
     ahead = RobotEnv(FakeRobot(), camera_dict={"front_camera": TimedCamera(1000.5)})
     ahead.get_obs()
     assert session_capture_time(ahead, FakeClock(5.0)) is None  # wall clock set back: no figure
+
+
+def test_capture_time_uses_only_prediction_cameras(monkeypatch):
+    monkeypatch.setattr(frame_capture_time.time, "time", lambda: 1000.0)
+    env = RobotEnv(FakeRobot(), camera_dict={
+        "front_camera": TimedCamera(999.98, monotonic=12.5),
+        "left_camera": TimedCamera(999.99, monotonic=12.75),
+        "right_camera": TimedCamera(999.90, monotonic=12.0),
+        "untimed_camera": UntimedCamera(),
+    })
+    env.get_obs()
+    selected = ("front_camera", "left_camera")
+    clock = MonotonicClock(opened_at=10.0)
+    assert session_capture_time(env, clock, camera_names=selected) == 2.5
+    assert abs(session_capture_time(env, FakeClock(5.0), camera_names=selected) - 4.98) < 1e-9
+    assert session_capture_time(env, clock, camera_names=("left_camera",)) == 2.75
+    assert session_capture_time(env, clock, camera_names=("left_camera", "missing")) is None
+
+
+def test_rtc_pairs_driver_timestamps_even_when_delivery_order_differs():
+    now = time.monotonic()
+    frames = RtcCameraFrames(("top", "left"), 1 / 30)
+    frames.publish("left", FRAME, now - 0.025, now - 0.033)
+    frames.publish("left", np.ones_like(FRAME), now - 0.001, now - 0.008)
+    frames.publish("top", FRAME, now, now - 0.032)
+
+    selected = frames.take(0)
+    assert selected["left"].image is FRAME
+    assert np.isclose(np.ptp(frame_times(selected.values())), 0.001)
+
+
+def test_rtc_pairing_uses_one_clock_and_rejects_incomplete_or_stale_sets():
+    now = time.monotonic()
+    frames = RtcCameraFrames(("top", "left"), 1 / 30)
+    frames.publish("top", FRAME, now - 0.003, now - 0.034)
+    assert frames.take(0) is None
+    frames.publish("left", FRAME, now - 0.002, None)
+    assert np.isclose(np.ptp(frame_times(frames.take(0).values())), 0.001)
+
+    stale = RtcCameraFrames(("top",), 1 / 30)
+    stale.publish("top", FRAME, now - 1, now - 1)
+    assert stale.take(0) is None
 
 
 def _v4l2_camera_with_cached_frame(timestamp):

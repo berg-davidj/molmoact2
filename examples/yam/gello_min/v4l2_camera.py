@@ -30,6 +30,7 @@ class V4L2Camera:
         read_wait_timeout_sec: float = 2.0,
         max_frame_age_sec: float = 1.5,
         frame_callback: Optional[Callable[[np.ndarray, float], None]] = None,
+        timed_frame_callback: Optional[Callable[[np.ndarray, float, float | None], None]] = None,
     ):
         self.device = device
         self._cap = cv2.VideoCapture()
@@ -67,6 +68,7 @@ class V4L2Camera:
         self._read_wait_timeout_sec = float(read_wait_timeout_sec)
         self._max_frame_age_sec = float(max_frame_age_sec)
         self._frame_callback = frame_callback
+        self._timed_frame_callback = timed_frame_callback
         self._frame_callback_error_reported = False
         self._latest_rgb: Optional[np.ndarray] = None
         self._latest_depth: Optional[np.ndarray] = None
@@ -88,6 +90,8 @@ class V4L2Camera:
             try:
                 with self._cap_lock:
                     ok, bgr = self._cap.read()
+                    driver_time = (self._cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
+                                   if ok and self._timed_frame_callback is not None else None)
                 if not ok or bgr is None:
                     raise RuntimeError(f"No frame from V4L2 camera {self.device}")
 
@@ -103,9 +107,18 @@ class V4L2Camera:
                     self._latest_frame_monotonic = captured_at
                     self._last_capture_error = None
                     self._frame_ready.set()
-                if self._frame_callback is not None:
+                if self._frame_callback is not None or self._timed_frame_callback is not None:
                     try:
-                        self._frame_callback(rgb, captured_at)
+                        if self._frame_callback is not None:
+                            self._frame_callback(rgb, captured_at)
+                        if self._timed_frame_callback is not None:
+                            # The V4L2 backend exposes its buffer timestamp through POS_MSEC.
+                            # Discard unsupported and non-monotonic-clock values.
+                            if driver_time is not None and not (
+                                0 < driver_time <= captured_at <= driver_time + self._max_frame_age_sec
+                            ):
+                                driver_time = None
+                            self._timed_frame_callback(rgb, captured_at, driver_time)
                     except Exception as exc:  # noqa: BLE001 -- recording must not break capture
                         report_error = False
                         with self._frame_lock:

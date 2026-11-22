@@ -54,9 +54,11 @@ from launch_yaml_eval_molmoact import (  # noqa: E402
 )
 from frame_capture_time import session_capture_time  # noqa: E402
 from orchestral_session_bridge import OrchestralDirectHost, OrchestralSessionHost  # noqa: E402
+from rtc_camera_frames import RtcCameraFrames, frame_times  # noqa: E402
 
 logger = logging.getLogger("rtc_rollout")
 ARM_DIM = 7
+RIG_CAMERAS = {"top": "front_camera", "left": "left_camera", "right": "right_camera"}
 
 
 class RolloutTelemetry:
@@ -69,6 +71,7 @@ class RolloutTelemetry:
         self.observations = 0
         self.without_capture_time = 0  # observations sent with no camera capture time
         self.failed_predictions = 0  # failed predictions the loop held through or stopped on
+        self.camera_pair_fallbacks = 0
 
     def report(self):
         completed = 0
@@ -89,10 +92,15 @@ class RolloutTelemetry:
             if "observation_prep_ms" in chunk.meta:
                 times["observation_prep_ms"] = chunk.meta["observation_prep_ms"]
                 times["client_queue_ms"] = 1000 * (chunk.t_sent - chunk.meta["queued_at"])
+                times["observation_to_predict_ms"] = times["observation_prep_ms"] + times["client_queue_ms"]
+            for name in ("camera_pair_wait_ms", "camera_skew_ms", "camera_delivery_ms"):
+                if name in chunk.meta:
+                    times[name] = chunk.meta[name]
             if chunk.meta.get("captured_at") is not None:
                 # Camera frame captured -> chunk back on the robot, both on the Session clock.
                 times["observation_to_action_ms"] = 1000 * (chunk.t_completed - chunk.meta["captured_at"])
                 times["frame_age_at_queue_ms"] = 1000 * (chunk.meta["queued_at"] - chunk.meta["captured_at"])
+                times["capture_to_predict_ms"] = 1000 * (chunk.t_sent - chunk.meta["captured_at"])
             if (timing := chunk.timings) is not None:
                 times.update(
                     client_encode_ms=timing.encode_us / 1000,
@@ -118,9 +126,10 @@ class RolloutTelemetry:
 
         logger.info(
             "RTC timing summary predictions=%d failed=%d prefix_rows_histogram=%s "
-            "late_handoffs=%d hold_ticks=%d tick_ms=%.1f observations=%d without_capture_time=%d",
+                    "late_handoffs=%d hold_ticks=%d tick_ms=%.1f observations=%d without_capture_time=%d "
+                    "camera_pair_fallbacks=%d",
             completed, failed, dict(sorted(prefixes.items())), late_count, self.hold_ticks, self.period_ms,
-            self.observations, self.without_capture_time,
+                    self.observations, self.without_capture_time, self.camera_pair_fallbacks,
         )
         for name, values in metrics.items():
             median, p95, p99 = np.percentile(values, (50, 95, 99))
@@ -197,7 +206,8 @@ def next_row(chunking, telemetry: RolloutTelemetry, max_prediction_failures: int
 
 
 def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_init: int,
-        seconds: float, telemetry: RolloutTelemetry, max_prediction_failures: int = 0) -> dict:
+        seconds: float, telemetry: RolloutTelemetry, max_prediction_failures: int = 0,
+        camera_frames: RtcCameraFrames | None = None) -> dict:
     """The control loop: one row per tick, one prediction in flight, until ``seconds`` or Ctrl-C."""
     endpoint_dim = host.identity["state_dim"]
     if endpoint_dim == ARM_DIM:
@@ -206,6 +216,7 @@ def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_i
         endpoint = slice(0, endpoint_dim)
     red_cap = host.policy_adapter == "pi05_yam_red_cap"
     session = host.session
+    prediction_cameras = {role: RIG_CAMERAS[role] for role in host.identity["camera_mapping"]}
     chunking = make_chunking(VerifiedCommittedSession(session), control_hz, s_min=s_min, d_init=d_init,
                              rebase_joints=6 if red_cap else 0, telemetry=telemetry)
     # An SDK that measures its control-loop latencies from the capture time takes it as
@@ -231,19 +242,35 @@ def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_i
             env.step_command_only(mask.command_target(target, measured), wait=False)
             sent += 1
         if chunking.should_replan():
-            capture_started = session.clock.now()
-            obs = env.get_obs()
-            captured_at = session_capture_time(env, session.clock)
+            meta = {}
+            frames = None
+            if camera_frames is not None:
+                wait_started = session.clock.now()
+                # Reserve half a command tick for dispatching the observation and scheduling the next row.
+                wait_budget = max(0.0, chunking.t_next - wait_started - 0.5 / control_hz)
+                frames = camera_frames.take(wait_budget)
+                meta["camera_pair_wait_ms"] = 1000 * (session.clock.now() - wait_started)
+                telemetry.camera_pair_fallbacks += frames is None
+            prep_started = session.clock.now()
+            if frames is None:
+                obs = env.get_obs()
+                captured_at = session_capture_time(env, session.clock, camera_names=prediction_cameras.values())
+                images = {role: obs[f"{camera}_rgb"] for role, camera in prediction_cameras.items()}
+            else:
+                images = {role: frame.image for role, frame in frames.items()}
+                timestamps = frame_times(frames.values())
+                captured_at = session.clock.now() - (time.monotonic() - min(timestamps))
+                meta["camera_skew_ms"] = 1000 * (max(timestamps) - min(timestamps))
+                if all(frame.captured_at is not None for frame in frames.values()):
+                    meta["camera_delivery_ms"] = 1000 * max(
+                        frame.ready_at - frame.captured_at for frame in frames.values()
+                    )
+                obs = env.get_robot_state()
             state = mask.validate_state(obs["joint_positions"], name="policy input state")[endpoint]
-            images = {"top": obs["front_camera_rgb"], "left": obs["left_camera_rgb"],
-                      "right": obs["right_camera_rgb"]}
-            inputs, query_state = host.predict_inputs(images, state)
+            inputs, query_state = host.predict_inputs(images, state, cameras_prepared=frames is not None)
             queued_at = session.clock.now()
-            meta = {
-                "query_state": query_state,
-                "observation_prep_ms": 1000 * (queued_at - capture_started),
-                "queued_at": queued_at,
-            }
+            meta.update(query_state=query_state, observation_prep_ms=1000 * (queued_at - prep_started),
+                        queued_at=queued_at)
             capture_time = {}
             telemetry.observations += 1
             if captured_at is not None:
@@ -279,6 +306,7 @@ def main(argv: Optional[list] = None) -> int:
                         help="default: config eval.server.policy_adapter")
     parser.add_argument("--instruction", default=None, help="default: config storage.language_instruction")
     parser.add_argument("--control-hz", type=float, default=None, help="default: config hz (15 for red-cap)")
+    parser.add_argument("--camera-fps", type=int, help="RTC V4L2 capture rate (default: rig config)")
     parser.add_argument("--s-min", type=int, default=7, help="rows of a chunk to run before the next request")
     parser.add_argument("--d-init", type=int, default=2, help="prediction delay in ticks until one is measured")
     parser.add_argument("--seconds", type=float, default=60.0, help="rollout length")
@@ -286,6 +314,8 @@ def main(argv: Optional[list] = None) -> int:
                         help="failed predictions to hold through before one ends the rollout (default 0: "
                              "the first one ends it)")
     args = parser.parse_args(argv)
+    if args.camera_fps is not None and args.camera_fps < 1:
+        parser.error("--camera-fps must be positive")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 
     left_cfg = OmegaConf.to_container(OmegaConf.load(args.config_path), resolve=True)
@@ -332,9 +362,32 @@ def main(argv: Optional[list] = None) -> int:
         logger.info("Deployment: %s, %d x %d actions at %.0f Hz; %s",
                     identity.get("deployment_id"), identity["action_horizon"], identity["action_dim"],
                     control_hz, mask.execution_summary)
-        env, *_ = _build_env(SimpleNamespace(config_path=args.config_path,
-                                             right_config_path=args.right_config_path,
-                                             control_hz=control_hz, max_steps=None))
+        roles = identity["camera_mapping"].keys()
+        camera_cfg = left_cfg["sensors"]["cameras"]
+        camera_fps = {}
+        camera_frames = None
+        if (not (eval_cfg.get("camera_server") or {}).get("enabled")
+                and all(str(cfg["device_id"]).startswith("/dev/") for cfg in camera_cfg.values())
+                and all(camera_cfg[RIG_CAMERAS[role]].get("enabled", True) for role in roles)):
+            for role in roles:
+                cfg = camera_cfg[RIG_CAMERAS[role]]
+                camera_fps[role] = int(args.camera_fps or cfg.get("rtc_fps") or eval_cfg.get("rtc_camera_fps")
+                                       or cfg.get("fps", 5))
+            # A frame from the slower camera has a faster-camera frame within half a fast period
+            # when both streams deliver on time. Keep the wait budget tied to the slower stream.
+            skew_limit = 0.5 / max(camera_fps.values()) if len(roles) == 2 else None
+            camera_frames = RtcCameraFrames(roles, 1 / min(camera_fps.values()), skew_limit=skew_limit)
+
+        def prepare_camera_frame(role, image, ready_at, captured_at):
+            # Resize on the capture threads so dispatch only needs to attach current joint feedback.
+            camera_frames.publish(role, host.prepare_camera(role, image), ready_at, captured_at)
+
+        env, *_ = _build_env(
+            SimpleNamespace(config_path=args.config_path, right_config_path=args.right_config_path,
+                            control_hz=control_hz, max_steps=None, camera_fps=camera_fps),
+            camera_roles=roles,
+            timed_camera_frame_callback=prepare_camera_frame if camera_frames is not None else None,
+        )
         try:
             rest = np.asarray(env.get_robot_state()["joint_positions"], dtype=np.float32).copy()
             input(f"Instruction: {instruction!r}. Clear the workspace, then press Enter to start "
@@ -344,7 +397,7 @@ def main(argv: Optional[list] = None) -> int:
             try:
                 summary = run(env, host, mask, control_hz=control_hz, instruction=instruction,
                               s_min=args.s_min, d_init=args.d_init, seconds=args.seconds, telemetry=telemetry,
-                              max_prediction_failures=args.max_prediction_failures)
+                              max_prediction_failures=args.max_prediction_failures, camera_frames=camera_frames)
                 logger.info("Rollout summary: %s", summary)
             except KeyboardInterrupt:
                 logger.info("Interrupted")

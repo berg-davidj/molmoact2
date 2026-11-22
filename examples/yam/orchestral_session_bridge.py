@@ -636,7 +636,10 @@ class OrchestralSessionHost:
             raise OrchestralBridgeError("Orchestral session is not open")
         return self._session
 
-    def predict_inputs(self, images, state):
+    def prepare_camera(self, role, image):
+        return _checkpoint_pixels(image, self.identity["camera_inputs"][role])
+
+    def predict_inputs(self, images, state, *, cameras_prepared=False):
         """Map rig cameras and state into a prediction and keep its reference pose."""
         import numpy as np
         missing = missing_cameras(images, self._camera_names)
@@ -644,7 +647,7 @@ class OrchestralSessionHost:
             raise OrchestralBridgeError(f"Orchestral observation is missing camera bytes: {missing}")
         if len(state) != self.identity["state_dim"]:
             raise OrchestralBridgeError(f"Orchestral endpoint state must be {self.identity['state_dim']} floats, got {len(state)}")
-        inputs = {name: _checkpoint_pixels(images[key], self.identity["camera_inputs"][key])
+        inputs = {name: images[key] if cameras_prepared else self.prepare_camera(key, images[key])
                   for key, name in self._camera_names.items()}
         query_state = np.asarray(state, dtype=np.float32).copy()
         if query_state.shape != (self.identity["state_dim"],) or not np.isfinite(query_state).all():
