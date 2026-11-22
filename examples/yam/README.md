@@ -331,7 +331,12 @@ PYTHONPATH=examples/yam python examples/yam/rtc_rollout.py \
   `observation_to_action_ms` runs from the capture of the oldest camera frame in an
   observation to its chunk arriving back on the robot, both on the robot's clocks.
   The capture time is when the frame was read from the driver, so sensor exposure
-  and driver buffering before that are not included.
+  and driver buffering before that are not included. It is on the monotonic clock
+  when the cameras run in this process or in a camera server on the same machine
+  (same boot ID), otherwise carried over from the wall clock. An observation with a
+  camera that reported no capture time gets no figure; the summary's
+  `without_capture_time` counts them, and the same count is the share of
+  Grafana's control-loop spans with `orc.loop.measured_from=observation`.
 
 ### Metrics
 

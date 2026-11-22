@@ -43,6 +43,7 @@ class RealSenseCamera(CameraDriver):
         self._latest_color_image = None
         self._latest_depth_image = None
         self._latest_frame_timestamp = None
+        self._latest_frame_monotonic = None
         self._last_capture_error = None
         self._frame_ready = threading.Event()
         self._stop_event = threading.Event()
@@ -80,11 +81,13 @@ class RealSenseCamera(CameraDriver):
                 color_image = np.asanyarray(color_frame.get_data()).copy()
                 depth_image = np.asanyarray(depth_frame.get_data()).copy()
                 timestamp = time.time()
+                monotonic = time.monotonic()
 
                 with self._frame_lock:
                     self._latest_color_image = color_image
                     self._latest_depth_image = depth_image
                     self._latest_frame_timestamp = timestamp
+                    self._latest_frame_monotonic = monotonic
                     self._last_capture_error = None
                     self._frame_ready.set()
 
@@ -136,18 +139,22 @@ class RealSenseCamera(CameraDriver):
             np.ndarray: The color image, shape=(H, W, 3)
             np.ndarray: The depth image, shape=(H, W, 1)
         """
-        image, depth, _timestamp = self.read_with_timestamp(img_size)
+        image, depth, _timestamp, _monotonic = self.read_with_capture_time(img_size)
         return image, depth
 
-    def read_with_timestamp(
+    def read_with_capture_time(
         self,
         img_size: Optional[Tuple[int, int]] = None,
-    ) -> Tuple[np.ndarray, np.ndarray, float]:
-        """``read()`` plus the frame's capture time.
+    ) -> Tuple[np.ndarray, np.ndarray, float, float]:
+        """``read()`` plus the frame's capture time: ``(image, depth, timestamp, monotonic)``.
 
-        The third value is the ``time.time()`` at which the capture thread stored this
-        frame, taken under the same lock as the frame, so it belongs to the frame returned
-        even when other threads read the camera too.
+        The times are when the capture thread stored this frame, taken under the same lock as
+        the frame, so they belong to the frame returned even when other threads read the
+        camera too.
+
+        The capture time comes in two clocks: ``timestamp`` (``time.time()``, for staleness
+        checks) and ``monotonic`` (``time.monotonic()``, read at the same moment, for latencies:
+        it never steps).
         """
         import cv2
 
@@ -158,6 +165,7 @@ class RealSenseCamera(CameraDriver):
             color_image = self._latest_color_image
             depth_image = self._latest_depth_image
             frame_timestamp = self._latest_frame_timestamp
+            frame_monotonic = self._latest_frame_monotonic
             last_error = self._last_capture_error
 
         if color_image is None or depth_image is None or frame_timestamp is None:
@@ -185,7 +193,7 @@ class RealSenseCamera(CameraDriver):
 
         depth = depth[:, :, None]
 
-        return image, depth, frame_timestamp
+        return image, depth, frame_timestamp, frame_monotonic
 
 
 def _debug_read(camera, save_datastream=False):

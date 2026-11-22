@@ -14,6 +14,8 @@ from typing import Any, Dict, Optional
 import numpy as np
 import zmq
 
+from frame_capture_time import boot_id
+
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +40,12 @@ class CameraClient:
         self.endpoint = endpoint
         self.request_timeout_ms = int(request_timeout_ms)
         self.max_frame_age_sec = max_frame_age_sec
-        # Capture time (time.time()) per camera of the frames the last get_obs() returned.
-        self.last_timestamps: Dict[str, float] = {}
+        # Capture time per camera of the frames the last get_obs() returned, None when the
+        # server reported none: time.time(), and time.monotonic() when the server runs on this
+        # machine's current boot (its monotonic clock is this process's).
+        self.last_timestamps: Dict[str, Optional[float]] = {}
+        self.last_monotonic: Dict[str, Optional[float]] = {}
+        self._boot_id = boot_id()
         self._ctx = zmq.Context.instance()
         self._sock: Optional[zmq.Socket] = None
         self._connect()
@@ -85,7 +91,11 @@ class CameraClient:
         """Return ``{cam_name: np.ndarray (H,W,3) uint8 RGB}`` with the latest frames."""
         resp = self._request("obs")
         frames: Dict[str, np.ndarray] = resp["frames"]
-        self.last_timestamps = {name: float(ts) for name, ts in (resp.get("timestamps") or {}).items() if ts}
+        stamps = resp.get("timestamps") or {}
+        self.last_timestamps = {name: float(stamps[name]) if stamps.get(name) else None for name in frames}
+        same_clock = self._boot_id is not None and resp.get("boot_id") == self._boot_id
+        monotonic = (resp.get("monotonic") or {}) if same_clock else {}
+        self.last_monotonic = {name: float(monotonic[name]) if monotonic.get(name) else None for name in frames}
         if self.max_frame_age_sec is not None:
             now = time.time()
             for name, ts in (resp.get("timestamps") or {}).items():

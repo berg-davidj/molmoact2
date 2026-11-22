@@ -43,6 +43,7 @@ from typing import Any, Dict, List, Optional
 import zmq
 from omegaconf import OmegaConf
 
+from frame_capture_time import boot_id
 from gello_min.realsense_camera import RealSenseCamera, get_device_ids
 
 
@@ -67,6 +68,7 @@ class CameraServer:
         heartbeat_sec: float = DEFAULT_HEARTBEAT_SEC,
     ) -> None:
         self.cameras = cameras
+        self._boot_id = boot_id()
         self.rep_endpoint = rep_endpoint
         self.pub_endpoint = pub_endpoint
         self.pub_period_sec = float(pub_period_sec)
@@ -91,18 +93,22 @@ class CameraServer:
         """Snapshot the latest color frame from every camera (RGB uint8)."""
         frames: Dict[str, Any] = {}
         timestamps: Dict[str, float] = {}
+        monotonic: Dict[str, float] = {}
         for name, cam in self.cameras.items():
             # The capture time of the frame returned, so the client can detect staleness and
             # time from capture. Two threads snapshot the cameras, so it must come with the frame.
-            read_with_timestamp = getattr(cam, "read_with_timestamp", None)
-            if read_with_timestamp is not None:
-                image, _depth, ts = read_with_timestamp()
+            read_with_capture_time = getattr(cam, "read_with_capture_time", None)
+            if read_with_capture_time is not None:
+                image, _depth, ts, mono = read_with_capture_time()
             else:
                 image, _depth = cam.read()
-                ts = getattr(cam, "_latest_frame_timestamp", None)
+                ts, mono = getattr(cam, "_latest_frame_timestamp", None), None
             frames[name] = image
             timestamps[name] = float(ts or 0.0)
-        return {"ok": True, "frames": frames, "timestamps": timestamps}
+            monotonic[name] = float(mono or 0.0)
+        # `monotonic` is this machine's time.monotonic(): a client uses it only on the same boot.
+        return {"ok": True, "frames": frames, "timestamps": timestamps, "monotonic": monotonic,
+                "boot_id": self._boot_id}
 
     # ------------------------------------------------------------------
     # Request handling
