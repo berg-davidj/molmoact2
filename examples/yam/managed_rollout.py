@@ -239,7 +239,9 @@ def rollout_joint_policy(host, identity, args):
                         camera, frame, timestamp,
                     ),
                 )
+                trace = None
                 try:
+                    trace = rollout["RolloutTrace"](recording, recording_start, host.session)
                     rollout["run"](
                         env, host.session, mask, seconds=args.seconds, instruction=args.instruction,
                         shadow=args.shadow, lead_steps=lead_steps,
@@ -252,12 +254,16 @@ def rollout_joint_policy(host, identity, args):
                         chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows,
                         state_padding=ISAAC_PARKED_RIGHT_ARM if bimanual_layout else None,
                         gripper_tolerance=MOLMOACT2_GRIPPER_TOLERANCE if family == "molmoact2" else 0.05,
-                        trace=rollout["RolloutTrace"](recording, recording_start, host.session),
+                        trace=trace,
                         committed_actions=args.committed_actions, stream_observations=family == "longwam",
                         noise_seed=args.noise_seed,
                     )
                 finally:
-                    env.close()
+                    try:
+                        env.close()
+                    finally:
+                        if trace is not None:
+                            trace.stop()
     finally:
         recording.disconnect()
     print(f"[rerun] Saved {', '.join(f'{name}={count}' for name, count in frame_counts.items())} frames to {output_path}",

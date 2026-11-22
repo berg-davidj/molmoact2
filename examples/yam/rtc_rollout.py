@@ -296,12 +296,16 @@ def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_i
     prediction_cameras = {role: RIG_CAMERAS[role] for role in host.identity["camera_mapping"]}
     record_prediction = None
     if trace is not None:
-        # The chunk as absolute targets and how long it took, for rollout_compare.py.
-        def record_prediction(chunk):
+        def prepare_actions(chunk):
             actions = host.robot_actions(chunk.actions, chunk.meta["query_state"])
             if actions.shape[-1] == 2 * ARM_DIM:
                 actions = actions[:, active_arm]
-            trace.prediction(chunk.seq, None, actions, session, chunk.t_completed - chunk.t_sent)
+            return actions
+
+        # The SDK calls this with actions.lock held. Convert to absolute targets on the writer.
+        def record_prediction(chunk):
+            trace.prediction(chunk.seq, None, chunk, session, chunk.t_completed - chunk.t_sent,
+                             prepare_chunk=prepare_actions)
     chunking = make_chunking(VerifiedCommittedSession(session), control_hz, s_min=s_min, d_init=d_init,
                              rebase_joints=6 if red_cap else 0, telemetry=telemetry, fusion=fusion,
                              record_prediction=record_prediction)
@@ -502,6 +506,7 @@ def main(argv: Optional[list] = None) -> int:
             camera_roles=roles,
             timed_camera_frame_callback=prepare_camera_frame if camera_frames is not None else None,
         )
+        recording = trace = None
         try:
             rest = np.asarray(env.get_robot_state()["joint_positions"], dtype=np.float32).copy()
             input(f"Instruction: {instruction!r}. Clear the workspace, then press Enter to start "
@@ -540,13 +545,17 @@ def main(argv: Optional[list] = None) -> int:
                 completed = False  # a fault holds and releases the arms; it never starts a new motion
                 raise
             finally:
-                trace.stop()
-                recording.disconnect()
                 if completed and eval_cfg.get("return_to_rest_on_exit", False):
                     return_to_captured_rest_pose(
                         env, rest, max_joint_step=float(eval_cfg.get("return_to_rest_max_joint_step", 0.01)))
         finally:
-            env.close()
+            try:
+                env.close()
+            finally:
+                if trace is not None:
+                    trace.stop()
+                if recording is not None:
+                    recording.disconnect()
     finally:
         try:
             host.close()

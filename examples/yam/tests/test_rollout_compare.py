@@ -1,6 +1,7 @@
 """Ranking rollout settings from scored runs: the measures, the bookkeeping and the verdict."""
 import json
 import math
+import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -196,6 +197,7 @@ def test_recordings_written_by_the_rollout_trace_are_ranked(tmp_path, monkeypatc
                 command = np.concatenate([row, np.zeros(7)])
                 trace.tick(arm, row, command, tick // 8, tick % 8, holding=False)
                 arm = command
+            trace.stop()
             recording.disconnect()
             record_settings(path, {"deployment": "pi05-test", "chunk_fusion": mode, "fusion_rows": 4,
                                    "execution_mode": "active_arm_hold"})
@@ -226,6 +228,58 @@ def test_recordings_written_by_the_rollout_trace_are_ranked(tmp_path, monkeypatc
     assert json.loads(rollout_compare.sidecar_path(shadow).read_text())["settings"]["execution_mode"] == "shadow"
 
 
+def test_trace_samples_do_not_wait_for_a_stalled_recording(monkeypatch, caplog):
+    pytest.importorskip("rerun")
+    import rollout_trace
+
+    clock = [10.0]
+    monkeypatch.setattr(rollout_trace, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(rollout_trace, "MAX_PENDING_EVENTS", 2)
+    entered = threading.Event()
+    release = threading.Event()
+    timestamps = []
+    paths = []
+    converted_on = []
+
+    def set_time(timeline, *, duration):
+        entered.set()
+        if not release.wait(timeout=5):
+            raise TimeoutError("test recorder was never released")
+        timestamps.append((timeline, duration))
+
+    def log(path, *components, static=False):
+        if not static:
+            paths.append(path)
+
+    def prepare_chunk(chunk):
+        converted_on.append(threading.current_thread())
+        return chunk
+
+    recording = SimpleNamespace(set_time=set_time, log=log)
+    trace = rollout_trace.RolloutTrace(recording, clock[0], SimpleNamespace())
+    try:
+        trace.event("first event")
+        assert entered.wait(timeout=5)
+        clock[0] += 1
+        trace.tick(np.zeros(14), None, None, 0, 0, holding=True)
+        trace.prediction(1, None, np.zeros((2, 7)), SimpleNamespace(), 0.05,
+                         prepare_chunk=prepare_chunk)
+        trace.event("overflow")
+        assert not converted_on
+        assert not paths
+        clock[0] += 1
+    finally:
+        release.set()
+        trace.stop()
+
+    assert timestamps == [("elapsed", 0.0), ("elapsed", 1.0), ("elapsed", 1.0)]
+    assert paths.count("/policy/events") == 2
+    assert "/robot/measured" in paths
+    assert "/policy/raw_actions" in paths
+    assert len(converted_on) == 1 and converted_on[0] is not threading.current_thread()
+    assert "Dropped 1 rollout trace samples" in caplog.text
+
+
 def test_right_arm_trace_scores_the_right_arm(tmp_path, monkeypatch):
     rr = pytest.importorskip("rerun")
     import rollout_trace
@@ -235,14 +289,15 @@ def test_right_arm_trace_scores_the_right_arm(tmp_path, monkeypatch):
     monkeypatch.setattr(rollout_trace.time, "monotonic", lambda: clock[0])
     path = tmp_path / "right.rrd"
     recording = rr.RecordingStream("test")
-    recording.save(path)
-    trace = rollout_trace.RolloutTrace(recording, 0.0, SimpleNamespace(), active_arm_side="right")
-    times, plan = ramp(40)
-    for tick, (measured, target) in enumerate(zip(following(plan), plan)):
-        clock[0] = times[tick]
-        trace.tick(np.concatenate([np.zeros(7), measured]), target,
-                   np.concatenate([np.zeros(7), target]), tick // 8, tick % 8, holding=False)
-    trace.stop()
+    with recording:
+        recording.save(path)
+        trace = rollout_trace.RolloutTrace(recording, 0.0, SimpleNamespace(), active_arm_side="right")
+        times, plan = ramp(40)
+        for tick, (measured, target) in enumerate(zip(following(plan), plan)):
+            clock[0] = times[tick]
+            trace.tick(np.concatenate([np.zeros(7), measured]), target,
+                       np.concatenate([np.zeros(7), target]), tick // 8, tick % 8, holding=False)
+        trace.stop()
     recording.disconnect()
 
     measures = rollout_compare.measure_recording(path, shadow=False)

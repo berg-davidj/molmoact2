@@ -141,7 +141,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                     chunk, elapsed = future.result()
                 except Exception as error:
                     if trace is not None:
-                        trace.event(f"Prediction {predictions} failed: {error}")
+                        trace.event("Prediction %d failed: %s", predictions, error)
                     raise
                 future = None
                 # Each command sent since the request corresponds to one row of the new
@@ -152,15 +152,15 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 first_row = None if missed or request_prefix_changed else pending.add(chunk, request_slot)
                 if trace is not None:
                     if not len(chunk):
-                        trace.event(f"Prediction {predictions} rejected: unreachable plan")
+                        trace.event("Prediction %d rejected: unreachable plan", predictions)
                     elif missed:
-                        trace.event(f"Prediction {predictions} dropped after {request_hold_ticks} hold ticks")
+                        trace.event("Prediction %d dropped after %d hold ticks", predictions, request_hold_ticks)
                     elif request_prefix_changed:
-                        trace.event(f"Prediction {predictions} dropped after the safety mask changed a committed target")
+                        trace.event("Prediction %d dropped after the safety mask changed a committed target", predictions)
                     elif first_row is None:
-                        trace.event(f"Prediction {predictions} dropped: every row was stale")
+                        trace.event("Prediction %d dropped: every row was stale", predictions)
                     else:
-                        trace.event(f"Prediction {predictions} accepted starting at row {first_row}")
+                        trace.event("Prediction %d accepted starting at row %d", predictions, first_row)
                 if len(chunk):
                     rejected_chunks = 0
                 else:
@@ -189,7 +189,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 request_prefix_changed = False
                 prefix = pending.committed_actions() if committed_actions and submitted_with else None
                 if trace is not None:
-                    trace.event(f"Prediction {predictions + 1} requested with {submitted_with} queued rows")
+                    trace.event("Prediction %d requested with %d queued rows", predictions + 1, submitted_with)
                 future = predictor.submit(checked_chunk, session, cameras, measured[:7].copy(),
                                           instruction, episode_start=(predictions == 0),
                                           action_shape=action_shape, model_label=model_label,
@@ -231,8 +231,6 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                            holding=row is None and future is not None)
             time.sleep(max(0, next_tick - time.monotonic()))
     finally:
-        if trace is not None:
-            trace.stop()
         predictor.shutdown(wait=False, cancel_futures=True)
     print(f"{model_label} rollout finished. {predictions} predictions, {rows} {'shadow rows' if shadow else 'commands'}, "
           f"{handoffs} prefetched handoffs, {misses} missed boundaries, {holds} hold ticks.")
@@ -363,13 +361,19 @@ def main():
                         camera, frame, timestamp,
                     ),
                 )
+                trace = None
                 try:
+                    trace = RolloutTrace(recording, recording_start, session)
                     run(env, session, mask, seconds=args.seconds, instruction=args.instruction, shadow=args.shadow,
                         lead_steps=args.prefetch_lead_steps,
                         chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows,
-                        trace=RolloutTrace(recording, recording_start, session))
+                        trace=trace)
                 finally:
-                    env.close()
+                    try:
+                        env.close()
+                    finally:
+                        if trace is not None:
+                            trace.stop()
         finally:
             recording.disconnect()
         print(f"[rerun] Saved {', '.join(f'{name}={count}' for name, count in frame_counts.items())} frames to {output_path}",
