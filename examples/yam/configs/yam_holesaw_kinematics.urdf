@@ -98,4 +98,12 @@
     <child link="grasp_site" />
     <origin xyz="0 0 0.1347" rpy="0 0 1.5707963267948966" />
   </joint>
+  <!-- Rho's end-effector frame (rho/src/convert_to_rho_v3.py): flange pose composed with T_TOOL (a 180 degree
+       turn about (1,1,0)/sqrt(2), rpy pi 0 pi/2) and the fitted offset D_LEFT, expressed in the flange frame. -->
+  <link name="rho_tool" />
+  <joint name="flange_to_rho_tool" type="fixed">
+    <parent link="gripper" />
+    <child link="rho_tool" />
+    <origin xyz="-0.00304 0.00147 0.00349" rpy="3.141592653589793 0 1.5707963267948966" />
+  </joint>
 </robot>

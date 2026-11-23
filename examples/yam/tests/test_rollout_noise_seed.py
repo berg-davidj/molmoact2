@@ -29,7 +29,7 @@ def test_seeded_probe_checks_both_prediction_paths(family):
             grant=SimpleNamespace(io_spec=SimpleNamespace(cameras={"scene": (4, 4)})),
         ),
     )
-    managed_rollout.probe(host, family, "go", committed_actions=True, noise_seed=2**64 - 1)
+    managed_rollout.probe(host, family, "go", noise_seed=2**64 - 1)
 
     first, continued = requests
     assert first["noise_seed"] == continued["noise_seed"] == 2**64 - 1
@@ -62,7 +62,7 @@ def test_flux_probe_checks_the_whole_gripper_plan(bad_prediction):
         supports_committed_actions=lambda: True,
     )
     with pytest.raises(ValueError, match="outside the accepted aperture range"):
-        managed_rollout.probe(host, "flux3-action", "go", committed_actions=True)
+        managed_rollout.probe(host, "flux3-action", "go")
     assert len(calls) == bad_prediction
 
 
@@ -80,7 +80,7 @@ def test_praxis_probe_preserves_the_rotation_and_zero_seed():
                            supports_committed_actions=lambda: True, begin_episode=lambda: None,
                            session=SimpleNamespace(predict=predict, grant=SimpleNamespace(
                                io_spec=SimpleNamespace(cameras={"exterior": (4, 4), "wrist": (4, 4)}))))
-    managed_rollout.probe(host, "praxis1", "pick", committed_actions=True, noise_seed=0)
+    managed_rollout.probe(host, "praxis1", "pick", noise_seed=0)
     assert [call["noise_seed"] for call in calls] == [0, 0]
     np.testing.assert_array_equal(calls[-1]["committed_actions"], actions[:1])
 

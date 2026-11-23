@@ -307,12 +307,18 @@ prediction delay and commits the rows the arm will run during that time. The nex
 chunk continues after the committed rows. If the prediction misses that boundary,
 the arm holds the last target until it arrives.
 
-For managed GR00T N1.7, Isaac 0.5, FLUX.3 Action, MolmoAct2, and Long-WAM, the
-YAM launcher commits queued robot commands by default with splice prefetch. It verifies that the
-Worker preserves a committed row before opening the motors. Use
-`--no-committed-actions` to run against an older Worker, or
-`--prefetch-lead-steps` to change how many rows it commits. Committed actions
-use splice handoffs. FLUX Workers serving the Holesaw checkpoint need
+Committed actions (RTC) are on by default for every family of `managed_rollout.py`; there is no
+opt-out flag. Every Worker and plugin must support them. The one temporary exception is the
+Holesaw families `rho`, `dreamzero`, `fastwam`, `dw05` and `aw0` (`COMMITTED_ACTIONS_DEFAULT_OFF`),
+which run without committed actions until their plugins support them; pass `--committed-actions`
+to opt in. The launcher commits the queued robot
+commands with splice prefetch, in the Worker's own action space (joint rows, padded rows, or tool
+poses, below), and verifies that the Worker preserves a committed row before opening the motors. A
+Worker that does not support committed actions is refused with an error that names the model and the
+`committed_actions` input its plugin must accept, and so is a Holesaw family started with
+`--committed-actions`. With committed actions on, `--prefetch-lead-steps` (at least 1) changes how
+many rows it commits; `--chunk-fusion` other than `splice` and `--prefetch-lead-steps 0` are
+rejected. FLUX Workers serving the Holesaw checkpoint need
 `rtc_inference_max_prefix` set to at least the configured prefetch lead (four by
 default). Long-WAM also streams each intervening camera observation to its
 Worker, using an SDK with `Session.observe`.
@@ -586,7 +592,7 @@ values (position, the first two rotation-matrix rows, and gripper). The launcher
 uses the configured robot model for forward and inverse kinematics and holds
 the inactive arm at the observed joint positions. It executes the reachable
 prefix and replans from fresh feedback. If the first target is unreachable,
-it rejects the prediction. Leave prefetch disabled for this adapter.
+it rejects the prediction. Committed rows are the queued commands as ten-value tool poses.
 
 Set the kinematics on the same `eval.server` or `eval.direct` block as the
 endpoint. Use the base and tool frames from training, list the six joint names
@@ -606,3 +612,42 @@ eval:
       joint_names: [joint1, joint2, joint3, joint4, joint5, joint6]
       max_joint_step_rad: 0.08
 ```
+
+## Holesaw fine-tuned families (`managed_rollout.py`)
+
+The launcher picks the family from the deployment's model ID (exact name or name plus `-...`). Each
+family below drives one YAM arm, takes no `--noise-seed`, and defaults to
+the Holesaw training instruction ("Pick up the hole saws from the moving conveyor belt and place
+them in the red case"). `--plan-rows N` executes only the first N rows of each chunk.
+
+| Family | Rate | Adapter | Worker contract | Cameras |
+|---|---|---|---|---|
+| `rho` | 30 Hz | `tool_pose_quat` | state 8 and action (H, 8): `[x y z qx qy qz qw gripper]`, absolute | `observation.image.0` top, `.1` left, `.2` right |
+| `dreamzero` | 15 Hz | `identity` | absolute joints (24, 7) | `video.middle`, `video.left` |
+| `fastwam` | 15 Hz | `identity` | absolute joints (32, 7) | `middle`, `left` |
+| `dw05` | 15 Hz, 8 of 32 rows | `identity` | absolute joints (32, 7) | `middle`, `left` |
+| `aw0` | 30 Hz | `single_arm_in_14` | (H, 14): this arm in 0..6, other arm parked | `cam_high` top, `cam_left_wrist` left |
+
+`tool_pose_quat` uses Rho's end-effector frame: position in meters in the arm base frame,
+xyzw quaternion, gripper 1 = open and not inverted. `configs/yam_holesaw_kinematics.urdf` holds that
+frame as the `rho_tool` body (the flange composed with Rho's fitted tool transform and offset), and
+`tool_pose_actions.QuatToolPoseActions` solves IK for each row, warm-started from the previous row,
+with a per-row joint bound of 0.12 rad at 15 Hz scaled to the control rate (0.06 rad at 30 Hz).
+Rho's base frame is the URDF `base` frame, so no base transform is configured; a rig where that
+differs passes `base_rotation` and `base_translation` to the class. Rows past an unreachable pose
+are dropped and the rollout replans.
+
+For `aw0` the rollout sends the parked constant `[0, 0, 0, 0, 0, 0, 1]` as the other arm's state and
+commands only the first seven action columns, so the physical right arm is held, never driven.
+The diffusion families clip the gripper to [0, 1] instead of stopping on a small overshoot.
+
+With `--committed-actions`, committed rows are in the Worker's own action space, and the Worker
+must return them unchanged as the first k rows of the chunk (k is at most the prefetch lead):
+
+- `rho`: (k, 8) end-effector rows, the forward kinematics of the queued joint targets in the
+  `rho_tool` frame, gripper not inverted.
+- `aw0`: (k, 14) rows, the queued joints in 0..6 and the parked constant in 7..13. Only the first
+  seven columns of a returned chunk are used.
+- `dreamzero`, `fastwam`, `dw05`: (k, 7) absolute joint rows. DreamZero's checkpoint is trained on
+  joints relative to the query state, so its plugin converts the absolute prefix against the query
+  state and returns absolute rows.

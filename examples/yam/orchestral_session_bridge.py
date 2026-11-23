@@ -30,6 +30,10 @@ ACTION_HORIZON = 30
 ACTION_SPACE = "joint_position"
 TOOL_POSE_ADAPTER = "tool_pose_rot6d"
 TOOL_POSE_MATRIX_ADAPTER = "tool_pose_matrix"
+#: Rho: absolute end-effector rows [x y z qx qy qz qw gripper] (xyzw quaternion, gripper 1 = open).
+TOOL_POSE_QUAT_ADAPTER = "tool_pose_quat"
+#: One YAM arm in a 14-value two-arm layout (left arm in 0..6, right arm parked by the rollout).
+SINGLE_ARM_IN_14 = "single_arm_in_14"
 PRAXIS_HOLESAW_BIMANUAL = "praxis_holesaw_bimanual"
 TEMPORAL_JOINT_ADAPTER = "temporal_joint"
 GR00T_YAM_ADAPTER = "gr00t_yam"
@@ -213,6 +217,14 @@ def _pixels(value: Any) -> Any:
     return np.asarray(value, dtype=np.uint8)
 
 
+#: Exact image names per adapter whose views carry no role words: the checkpoint's own numbering or
+#: its original rig's names. Only a set of these names that includes the overhead view is accepted.
+_ADAPTER_VIEW_NAMES = {
+    TOOL_POSE_QUAT_ADAPTER: {"0": "top", "1": "left", "2": "right"},
+    SINGLE_ARM_IN_14: {"cam_high": "top", "cam_left_wrist": "left", "cam_right_wrist": "right"},
+}
+
+
 def _camera_role(name: str, policy_adapter: str = "identity") -> Optional[str]:
     """Resolve a named view to this rig's physical camera, never by input order."""
     terminal = re.split(r"[./]", name)[-1].lower()
@@ -288,6 +300,15 @@ def _checkpoint_input_names(
         if set(images) != {"top_left", "wrist_left", "wrist_right"} or len(states) != 1:
             raise OrchestralBridgeError("Bimanual Holesaw requires the overhead and both Praxis wrist slots")
         return {"top": "top_left", "left": "wrist_right", "right": "wrist_left"}, states[0]
+    views = _ADAPTER_VIEW_NAMES.get(policy_adapter)
+    if views is not None:
+        terminals = {re.split(r"[./]", name)[-1].lower(): name for name in images}
+        if (len(terminals) == len(images) and set(terminals) <= set(views)
+                and any(views[t] == "top" for t in terminals) and len(states) == 1):
+            return {views[t]: name for t, name in terminals.items()}, states[0]
+        raise OrchestralBridgeError(
+            f"{policy_adapter} requires image inputs named from {sorted(views)} including the overhead "
+            f"view; got {images}")
     # This rig's GR00T hole-saw layout: ``top_left`` is the overhead (middle)
     # camera, confirmed by the operator. Only this exact trio is accepted, so
     # ``top_left`` beside any other set of views is still refused as ambiguous.
@@ -331,6 +352,8 @@ def _checkpoint_geometry(contract: Any, policy_adapter="identity", *, allow_came
             TOOL_POSE_ADAPTER: {(7, 10)},
             TOOL_POSE_MATRIX_ADAPTER: {(8, 13)},
             PRAXIS_HOLESAW_BIMANUAL: {(16, 26)},
+            TOOL_POSE_QUAT_ADAPTER: {(8, 8)},
+            SINGLE_ARM_IN_14: {(14, 14)},
         }.get(policy_adapter, {(7, 7), (14, 14)})
         if (not state_shape or len(state_shape) != 1
                 or not action_shape or len(action_shape) != 2
@@ -466,7 +489,8 @@ class OrchestralSessionHost:
         if observation_encoding not in OBSERVATION_ENCODINGS:
             raise OrchestralBridgeError(f"unsupported observation encoding: {observation_encoding!r}")
         if policy_adapter not in {"identity", "pi05_yam_red_cap", TOOL_POSE_ADAPTER, TOOL_POSE_MATRIX_ADAPTER,
-                                   TEMPORAL_JOINT_ADAPTER, GR00T_YAM_ADAPTER, PRAXIS_HOLESAW_BIMANUAL}:
+                                   TEMPORAL_JOINT_ADAPTER, GR00T_YAM_ADAPTER, PRAXIS_HOLESAW_BIMANUAL,
+                                   TOOL_POSE_QUAT_ADAPTER, SINGLE_ARM_IN_14}:
             raise OrchestralBridgeError(f"unsupported policy_adapter: {policy_adapter!r}")
         self.policy_adapter = policy_adapter
         self.allow_camera_subset = allow_camera_subset
@@ -625,8 +649,6 @@ class OrchestralSessionHost:
     def supports_committed_actions(self):
         if self._session is None:
             raise OrchestralBridgeError("Orchestral session is not open")
-        if self.policy_adapter == TOOL_POSE_ADAPTER:
-            return False
         session = self._session
         query = getattr(type(session), "supports_committed_actions", None)
         if query is not None and session.supports_committed_actions:
@@ -705,11 +727,10 @@ class OrchestralSessionHost:
         inputs, query_state = self.predict_inputs(images, state)
         prefix = None
         if committed_actions is not None:
-            if self.policy_adapter == TOOL_POSE_ADAPTER:
-                raise OrchestralBridgeError("The tool pose adapter cannot transform committed commands")
             prefix = np.array(committed_actions, dtype=np.float32, copy=True)
             max_prefix = self.identity["action_horizon"]
-            if self.policy_adapter not in {TOOL_POSE_MATRIX_ADAPTER, PRAXIS_HOLESAW_BIMANUAL}:
+            if self.policy_adapter not in {TOOL_POSE_MATRIX_ADAPTER, PRAXIS_HOLESAW_BIMANUAL,
+                                           TOOL_POSE_ADAPTER, TOOL_POSE_QUAT_ADAPTER}:
                 max_prefix -= 1
             if (prefix.ndim != 2 or prefix.shape[1] != self.identity["action_dim"]
                     or not 0 < len(prefix) <= max_prefix
@@ -738,7 +759,7 @@ class OrchestralSessionHost:
         actions = self.robot_actions(actions, query_state)
         timings = asdict(result.timings)
         return {"actions": actions.tolist(), "horizon": len(actions),
-                "action_space": self.policy_adapter if self.policy_adapter in {TOOL_POSE_ADAPTER, TOOL_POSE_MATRIX_ADAPTER, PRAXIS_HOLESAW_BIMANUAL} else ACTION_SPACE,
+                "action_space": self.policy_adapter if self.policy_adapter in {TOOL_POSE_ADAPTER, TOOL_POSE_MATRIX_ADAPTER, PRAXIS_HOLESAW_BIMANUAL, TOOL_POSE_QUAT_ADAPTER} else ACTION_SPACE,
                 "telemetry": {**timings, "server_infer_ms": result.timings.accel_exec_us / 1000,
                               "trace_id": result.trace_id or getattr(self._session, "last_predict_trace_id", ""),
                               "request_bytes": transport.get("client_transaction", {}).get("request_bytes"),

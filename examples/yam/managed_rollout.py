@@ -29,7 +29,20 @@ RIGHT_CONFIG = "examples/yam/configs/yam_deployment_right.yaml"
 ISAAC_PARKED_RIGHT_ARM = np.array([0, 0, 0, 0, 0, 0, 1], dtype=np.float32)
 ISAAC_BIMANUAL_CONTROL_HZ = 30  # the release checkpoint's rate; one action per 30 Hz step
 ISAAC_BIMANUAL_PLAN_ROWS = 30   # replan every second instead of running the full 2 s chunk
-COMMITTED_ACTION_FAMILIES = frozenset({"gr00t", "isaac05", "flux3-action", "molmoact2", "longwam", "praxis1"})
+# Committed actions (RTC) are on for every family except these. TEMPORARY EXCEPTION: their Orchestral
+# plugins do not support committed actions yet, so they default to off and opt in with
+# --committed-actions. Remove a family from this set when its plugin supports them.
+COMMITTED_ACTIONS_DEFAULT_OFF = frozenset({"rho", "dreamzero", "fastwam", "dw05", "aw0"})
+# Families fine-tuned on the Holesaw task. None has a noise-seed path.
+HOLESAW_INSTRUCTION = "Pick up the hole saws from the moving conveyor belt and place them in the red case"
+HOLESAW_FINE_TUNED_FAMILIES = frozenset({"rho", "dreamzero", "fastwam", "dw05", "aw0"})
+# Checkpoints trained at 30 Hz; every other family defaults to 15 Hz.
+CONTROL_HZ_30_FAMILIES = frozenset({"flux3-action", "longwam", "rho", "aw0"})
+# AW-0 keeps the RoboTwin two-arm layout: our arm is in dims 0..6 and the other arm is the constant
+# the checkpoint was trained with. Only the left seven action columns ever reach the robot.
+PARKED_RIGHT_ARM_FAMILIES = frozenset({"isaac05", "aw0"})
+# Rows of each chunk the rollout executes before replanning. Upstream DW05 runs 8 of its 32 rows.
+DEFAULT_PLAN_ROWS = {"verne": 4, "dw05": 8}
 NOISE_SEED_FAMILIES = frozenset({"pi05", "flux3-action", "longwam", "praxis1"})
 # The rig's arm swap belongs to this checkpoint, not to every bimanual Praxis model.
 PRAXIS_HOLESAW_BIMANUAL_CHECKPOINT = (
@@ -51,13 +64,19 @@ def run_tailscale(self, *args, timeout=10.0):
 ManagedTailnetNode.__init__ = initialize_node
 TailscaleCli.run = run_tailscale
 
+# (model ID prefix, family). Every family here always uses committed actions.
+FAMILY_PREFIXES = (("pi05", "pi05"), ("gr00t", "gr00t"),
+                   ("molmoact2", "molmoact2"), ("dm05", "dexmal"),
+                   ("praxis1", "praxis1"), ("verne", "verne"), ("isaac05", "isaac05"),
+                   ("flux3-action", "flux3-action"), ("longwam", "longwam"), ("long-wam", "longwam"),
+                   ("rho", "rho"), ("dreamzero", "dreamzero"), ("fastwam", "fastwam"),
+                   ("dw05", "dw05"), ("aw0", "aw0"))
+
+
 def policy_family(model_id):
     """Select a YAM action adapter using the registered model ID."""
     name = model_id.lower()
-    for prefix, family in (("pi05", "pi05"), ("gr00t", "gr00t"),
-                           ("molmoact2", "molmoact2"), ("dm05", "dexmal"),
-                           ("praxis1", "praxis1"), ("verne", "verne"), ("isaac05", "isaac05"),
-                           ("flux3-action", "flux3-action"), ("longwam", "longwam"), ("long-wam", "longwam")):
+    for prefix, family in FAMILY_PREFIXES:
         if name == prefix or name.startswith(prefix + "-"):
             return family
     return None
@@ -73,26 +92,53 @@ def placeholder_state(family, dimension):
         return np.array([0.3, 0, 0.3, 1, 0, 0, 0, 0.5], dtype=np.float32)
     if family == "verne":
         return np.array([0.3, 0, 0.3, 0, 0, 0, 0.5], dtype=np.float32)
+    if family == "rho":
+        return np.array([0.3, 0, 0.3, 0, 0, 0, 1, 0.5], dtype=np.float32)
     state = np.zeros(dimension, dtype=np.float32)
     state[0], state[6] = np.pi, 0.5
     if dimension == 14:
         state[13] = 0.5
+        if family == "aw0":
+            state[7:] = ISAAC_PARKED_RIGHT_ARM
     return state
 
 
-def probe(host, family, instruction, *, committed_actions=False, noise_seed=None):
+def committed_contract(family, identity):
+    """What a Worker must accept as ``committed_actions`` for this family, for the refusal message."""
+    width, horizon = identity["action_dim"], identity["action_horizon"]
+    space = {
+        "rho": "absolute end-effector rows [x y z qx qy qz qw gripper] in the rho_tool frame (the commands the "
+               "arm will run, as forward kinematics), gripper 1 = open",
+        "aw0": "absolute 14-value joint rows: this arm in 0..6 and the parked right arm [0,0,0,0,0,0,1] in 7..13",
+        "praxis1": "absolute tool-pose rows in the layout the Worker returns",
+        "verne": "absolute tool-pose rows in the layout the Worker returns",
+    }.get(family, "absolute rows in the same space and width as the returned actions")
+    return (f"a committed_actions input of shape (k, {width}), 1 <= k < {horizon}, holding {space}, "
+            f"and a returned chunk whose first k rows equal it exactly")
+
+
+def require_committed_actions(host, family):
+    """Committed actions (RTC) are mandatory: a Worker without them is refused before any motion."""
+    if not host.supports_committed_actions():
+        model = host.identity.get("model_ref") or family
+        raise SystemExit(
+            f"The {family} Worker ({model}) does not support committed actions, which every Worker must. "
+            f"Its plugin must implement {committed_contract(family, host.identity)}."
+        )
+
+
+def committed_enabled(family, args):
+    """Committed actions are on unless the family is a temporary exception and the user did not opt in."""
+    return family not in COMMITTED_ACTIONS_DEFAULT_OFF or bool(getattr(args, "committed_actions", False))
+
+
+def probe(host, family, instruction, *, committed_actions=True, noise_seed=None):
+    if committed_actions:
+        require_committed_actions(host, family)
     if family == "pi05":
-        if not host.supports_committed_actions():
-            raise SystemExit("The pi0.5 Worker did not confirm committed-actions support.")
         if noise_seed is None:
             print("Staging pi0.5 session opened and RTC support confirmed.")
             return
-        committed_actions = True
-    elif committed_actions and not host.supports_committed_actions():
-        raise SystemExit(
-            f"The {family} Worker does not advertise committed actions. "
-            "Select an RTC-capable Worker or pass --no-committed-actions."
-        )
     if family == "longwam" and not getattr(host.session, "supports_observe", False):
         raise SystemExit("Long-WAM requires a Worker and SDK that support observation-only requests.")
 
@@ -107,7 +153,7 @@ def probe(host, family, instruction, *, committed_actions=False, noise_seed=None
         history = TemporalJointHistory(host.identity["history_rows"])
         history.observe(cameras, state)
         cameras, inputs = history.inputs()
-    elif family == "isaac05" and len(state) == 14:
+    elif family in PARKED_RIGHT_ARM_FAMILIES and len(state) == 14:
         state[7:] = ISAAC_PARKED_RIGHT_ARM
 
     predict = dict(cameras=cameras, instruction=instruction, **inputs)
@@ -118,23 +164,29 @@ def probe(host, family, instruction, *, committed_actions=False, noise_seed=None
         raise SystemExit(f"{family} did not return a finite action chunk of shape {expected}.")
     if family == "flux3-action":
         clip_predicted_aperture(actions[:, 6], family)
-    if committed_actions:
-        if family == "longwam":
-            host.session.observe(**predict)
-        prefix = actions[:1].copy()
-        if family != "praxis1":
-            prefix[:, 6] = np.clip(prefix[:, 6], 0, 1)
-        if family == "isaac05" and expected[1] == 14:
-            prefix[:, 7:] = ISAAC_PARKED_RIGHT_ARM
-        continued = np.asarray(
-            host.session.predict(**predict, **noise, committed_actions=prefix).actions, dtype=np.float32,
-        )
-        if continued.shape != expected or not np.isfinite(continued).all() or not np.array_equal(continued[:1], prefix):
-            raise SystemExit(f"{family} did not return a finite chunk preserving the committed action.")
-        if family == "flux3-action":
-            clip_predicted_aperture(continued[:, 6], family)
+    if family == "longwam":
+        host.session.observe(**predict)
+    if not committed_actions:
+        host.begin_episode()
+        print(f"Staging {family} returned a finite {expected[0]} × {expected[1]} action chunk "
+              f"using {', '.join(camera_mapping.values())}.", flush=True)
+        return
+    prefix = actions[:1].copy()
+    if family in {"rho", "verne"}:  # pose rows end with the gripper (praxis1's inverted one is left as is)
+        prefix[:, -1] = np.clip(prefix[:, -1], 0, 1)
+    elif family != "praxis1":
+        prefix[:, 6] = np.clip(prefix[:, 6], 0, 1)
+    if family in PARKED_RIGHT_ARM_FAMILIES and expected[1] == 14:
+        prefix[:, 7:] = ISAAC_PARKED_RIGHT_ARM
+    continued = np.asarray(
+        host.session.predict(**predict, **noise, committed_actions=prefix).actions, dtype=np.float32,
+    )
+    if continued.shape != expected or not np.isfinite(continued).all() or not np.array_equal(continued[:1], prefix):
+        raise SystemExit(f"{family} did not return a finite chunk preserving the committed action.")
+    if family == "flux3-action":
+        clip_predicted_aperture(continued[:, 6], family)
     host.begin_episode()
-    status = " and preserved a committed row" if committed_actions else ""
+    status = " and preserved a committed row"
     print(f"Staging {family} returned a finite {expected[0]} × {expected[1]} action chunk "
           f"using {', '.join(camera_mapping.values())}{status}.", flush=True)
 
@@ -151,40 +203,49 @@ def rollout_joint_policy(host, identity, args):
     rollout = runpy.run_path(str(Path(__file__).with_name("groot_rollout.py")))
     family = args.policy_family
     checked_shape = (identity["action_horizon"], identity["action_dim"])
-    bimanual_layout = family == "isaac05" and (identity["state_dim"], checked_shape[1]) == (14, 14)
+    bimanual_layout = family in PARKED_RIGHT_ARM_FAMILIES and (identity["state_dim"], checked_shape[1]) == (14, 14)
     praxis_bimanual = family == "praxis1" and identity["state_dim"] == 16
-    state_width, action_width = {"praxis1": (16, 26) if praxis_bimanual else (8, 13), "verne": (7, 10)}.get(
+    state_width, action_width = {"praxis1": (16, 26) if praxis_bimanual else (8, 13), "verne": (7, 10), "rho": (8, 8),
+                                         "aw0": (14, 14)}.get(
         family, (14, 14) if bimanual_layout else (7, 7))
     if identity["state_dim"] != state_width or checked_shape[1] != action_width or checked_shape[0] <= 0:
         raise SystemExit(f"Unexpected {family} contract for YAM: {checked_shape}")
     if args.control_hz is None:
-        args.control_hz = (ISAAC_BIMANUAL_CONTROL_HZ if bimanual_layout
-                           else 30 if family in {"flux3-action", "longwam"} else 15)
-    plan_rows = 4 if family == "verne" else checked_shape[0]
-    if bimanual_layout:
+        args.control_hz = (ISAAC_BIMANUAL_CONTROL_HZ if bimanual_layout and family == "isaac05"
+                           else 30 if family in CONTROL_HZ_30_FAMILIES else 15)
+    plan_rows = getattr(args, "plan_rows", None) or min(DEFAULT_PLAN_ROWS.get(family, checked_shape[0]), checked_shape[0])
+    if getattr(args, "plan_rows", None) is None and bimanual_layout and family == "isaac05":
         plan_rows = min(plan_rows, ISAAC_BIMANUAL_PLAN_ROWS)
+    if plan_rows > checked_shape[0]:
+        raise SystemExit(f"--plan-rows must not exceed the chunk length ({checked_shape[0]})")
     lead_steps = args.prefetch_lead_steps
     if lead_steps is None:
-        default_lead = {"verne": 0, "flux3-action": 4 if args.committed_actions else 0, "longwam": 16}.get(family, 8)
+        # The default lead is about 0.5 s of queued rows: 8 at 15 Hz, 16 at 30 Hz (Rho, AW-0).
+        default_lead = {"verne": 1, "flux3-action": 4, "longwam": 16,
+                        "rho": 16, "aw0": 16}.get(family, 8)
         lead_steps = min(default_lead, plan_rows - 1)
     if lead_steps >= plan_rows:
         raise SystemExit(f"--prefetch-lead-steps must be below the rollout plan length ({plan_rows})")
-    if args.committed_actions and (args.chunk_fusion != "splice" or lead_steps < 1):
-        raise SystemExit("Committed actions require --chunk-fusion splice and at least one prefetch lead step.")
+    committed = committed_enabled(family, args)
+    if committed and (args.chunk_fusion != "splice" or lead_steps < 1):
+        raise SystemExit("Committed actions are on: use --chunk-fusion splice and at least one prefetch lead step.")
     temporal_history = None
     if "history_rows" in identity:
         from temporal_joint_history import TemporalJointHistory
 
         temporal_history = TemporalJointHistory(identity["history_rows"])
     pose_actions = None
-    if family in {"praxis1", "verne"}:
-        from tool_pose_actions import HolesawBimanualActions, ToolPoseActions
+    if family in {"praxis1", "verne", "rho"}:
+        from tool_pose_actions import HolesawBimanualActions, QuatToolPoseActions, ToolPoseActions
 
-        adapter = HolesawBimanualActions if praxis_bimanual else ToolPoseActions
+        adapter = QuatToolPoseActions if family == "rho" else HolesawBimanualActions if praxis_bimanual else ToolPoseActions
         pose_actions = adapter(
             model_path=Path(__file__).with_name("configs") / "yam_holesaw_kinematics.urdf",
-            base_body="base", tool_body="grasp_site" if praxis_bimanual else "gripper",
-            joint_names=[f"joint{i}" for i in range(1, 7)], max_joint_step_rad=0.12,
+            base_body="base",
+            tool_body="rho_tool" if family == "rho" else "grasp_site" if praxis_bimanual else "gripper",
+            joint_names=[f"joint{i}" for i in range(1, 7)],
+            # The 0.12 rad bound is per 15 Hz row; keep the same joint speed at 30 Hz.
+            max_joint_step_rad=0.12 * 15 / args.control_hz if family == "rho" else 0.12,
         )
     left = OmegaConf.to_container(OmegaConf.load(LEFT_CONFIG), resolve=True)
     right = OmegaConf.to_container(OmegaConf.load(RIGHT_CONFIG), resolve=True)
@@ -214,9 +275,9 @@ def rollout_joint_policy(host, identity, args):
     record_settings(output_path, dict(
         deployment=args.deployment, family=args.policy_family, control_hz=args.control_hz,
         chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows,
-        prefetch_lead_steps=lead_steps, committed_actions=args.committed_actions,
+        prefetch_lead_steps=lead_steps, committed_actions=committed,
         execution_mode="shadow" if args.shadow else "active_arm_hold",
-        seconds=args.seconds, noise_seed=args.noise_seed, instruction=args.instruction))
+        seconds=args.seconds, noise_seed=args.noise_seed, instruction=args.instruction, plan_rows=plan_rows))
     sensor_roles = {
         "top": "front_camera_rgb",
         "left": "left_camera_rgb",
@@ -269,7 +330,7 @@ def rollout_joint_policy(host, identity, args):
                         chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows,
                         state_padding=ISAAC_PARKED_RIGHT_ARM if bimanual_layout else None,
                         trace=trace,
-                        committed_actions=args.committed_actions, stream_observations=family == "longwam",
+                        committed_actions=committed, stream_observations=family == "longwam",
                         noise_seed=args.noise_seed,
                     )
                 finally:
@@ -524,7 +585,8 @@ def soak_endpoint(host, identity, args):
 def main():
     from omegaconf import OmegaConf
     from orchestral_session_bridge import (
-        GR00T_YAM_ADAPTER, PRAXIS_HOLESAW_BIMANUAL, TEMPORAL_JOINT_ADAPTER, TOOL_POSE_ADAPTER, TOOL_POSE_MATRIX_ADAPTER,
+        GR00T_YAM_ADAPTER, PRAXIS_HOLESAW_BIMANUAL, SINGLE_ARM_IN_14, TEMPORAL_JOINT_ADAPTER, TOOL_POSE_ADAPTER,
+        TOOL_POSE_MATRIX_ADAPTER, TOOL_POSE_QUAT_ADAPTER,
         OrchestralSessionHost, parse_noise_seed,
     )
 
@@ -577,10 +639,13 @@ def main():
     # One action per control step: 15 Hz for the checkpoints trained on 15 Hz data, 30 Hz for
     # an Isaac 0.5 checkpoint in the release's bimanual layout.
     settings.add_argument("--control-hz", type=float)
-    settings.add_argument("--instruction", default=OmegaConf.load(LEFT_CONFIG).storage.language_instruction)
+    settings.add_argument("--instruction", help="default: the training instruction of the selected family")
+    settings.add_argument("--committed-actions", action="store_true",
+                          help="condition predictions on the queued commands; needed only for the families in "
+                               "COMMITTED_ACTIONS_DEFAULT_OFF, all others always do")
+    settings.add_argument("--plan-rows", type=int,
+                          help="rows of each chunk to execute before replanning (default: the family's, else the whole chunk)")
     settings.add_argument("--prefetch-lead-steps", type=int)
-    settings.add_argument("--committed-actions", action=argparse.BooleanOptionalAction,
-                          help="condition predictions on queued commands (default for supported models with splice prefetch)")
     # How successive action chunks are joined; chunk_fusion.py describes each mode.
     settings.add_argument("--chunk-fusion", choices=CHUNK_FUSION_MODES, default="splice")
     settings.add_argument("--fusion-rows", type=int, default=4,
@@ -592,6 +657,11 @@ def main():
     args.deployment = target.deployment
     args.soak_hours = target.soak_hours
     args.policy_family = family
+    if args.instruction is None:
+        args.instruction = (HOLESAW_INSTRUCTION if family in HOLESAW_FINE_TUNED_FAMILIES
+                            else OmegaConf.load(LEFT_CONFIG).storage.language_instruction)
+    if args.plan_rows is not None and args.plan_rows < 1:
+        settings.error("--plan-rows must be at least 1")
     args.noise_seed = target.noise_seed
     if not math.isfinite(args.seconds) or args.seconds <= 0:
         settings.error("--seconds must be positive and finite")
@@ -601,12 +671,14 @@ def main():
         settings.error("--soak-hours must be finite and nonnegative")
     if args.prefetch_lead_steps is not None and args.prefetch_lead_steps < 0:
         settings.error("--prefetch-lead-steps must be nonnegative")
-    if args.committed_actions is None:
-        args.committed_actions = (
-            family in COMMITTED_ACTION_FAMILIES and args.chunk_fusion == "splice" and args.prefetch_lead_steps != 0
-        )
-    if args.committed_actions and family not in COMMITTED_ACTION_FAMILIES and family != "pi05":
-        settings.error(f"{family} has no committed-action rollout adapter")
+    # Committed actions (RTC) need splice handoffs and at least one queued row.
+    args.committed_actions = committed_enabled(family, args)
+    if target.soak_hours <= 0 and args.committed_actions and (
+            args.chunk_fusion != "splice" or args.prefetch_lead_steps == 0):
+        settings.error("committed actions are on: use --chunk-fusion splice and --prefetch-lead-steps of at least 1")
+    if family in COMMITTED_ACTIONS_DEFAULT_OFF and not args.committed_actions and target.soak_hours <= 0:
+        print(f"Committed actions are off for {family} until its plugin supports them; "
+              "pass --committed-actions to use them.", flush=True)
     if args.fusion_rows < 1:
         settings.error("--fusion-rows must be at least 1")
     if family == "verne" and not (target.probe or target.soak_hours > 0 or args.shadow):
@@ -620,6 +692,8 @@ def main():
             target.praxis_holesaw_bimanual or deployment.checkpoint_uri == PRAXIS_HOLESAW_BIMANUAL_CHECKPOINT
         ) else TOOL_POSE_MATRIX_ADAPTER,
         "verne": TOOL_POSE_ADAPTER,
+        "rho": TOOL_POSE_QUAT_ADAPTER,
+        "aw0": SINGLE_ARM_IN_14,
         "pi05": "pi05_yam_red_cap" if target.soak_hours <= 0 else "identity",
     }.get(family, "identity")
     host = OrchestralSessionHost(
@@ -629,7 +703,8 @@ def main():
     try:
         identity = host.open()
         if target.soak_hours <= 0:
-            probe(host, family, args.instruction, committed_actions=args.committed_actions, noise_seed=args.noise_seed)
+            probe(host, family, args.instruction, committed_actions=args.committed_actions,
+                  noise_seed=args.noise_seed)
         if not target.probe:
             if args.soak_hours > 0:
                 soak_endpoint(host, identity, args)

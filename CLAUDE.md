@@ -79,3 +79,13 @@ The MolmoAct2 checkpoints were not released with `bfloat16` or local-snapshot lo
 - `predict_action`'s mode kwarg differs across checkpoints: the DROID revision uses `action_mode="continuous"` (defaulted), the YAM revision uses `inference_action_mode="continuous"` (required, no default). Each server must use its checkpoint's name — copying the call site verbatim between embodiments will TypeError at warmup.
 - Don't edit the cached `modeling_molmoact2.py` directly — extend `_patch_modeling_for_bf16` so the change survives a cache rebuild. The two textual needles only match the DROID snapshot revision: on DROID, `patched_bf16_dtype` no longer matches but `patched_bf16_to_array` still applies; on YAM, both are already fixed upstream and warn "needle not found" — bf16 inference works regardless. Keep the patch code in place so re-downloads of older snapshots still work.
 - `logs/inference_script.py` is the DROID Polymetis client bridge (untracked in this branch). It depends on `pyzed.sl`, `cv2`, `requests`, `json_numpy`, and optionally `pandas` for Excel logging — don't introduce server-only deps into it, and don't assume future contributors will have the file.
+
+## Rollout client rules
+
+Committed actions (RTC) are on by default for every policy family in `examples/yam/managed_rollout.py`.
+Every worker/plugin must support them; the client uses them and errors if a worker does not, with no
+opt-out flag. Temporary exception: the Holesaw families `rho`, `dreamzero`, `fastwam`, `dw05` and `aw0`
+(`COMMITTED_ACTIONS_DEFAULT_OFF`) are default-off until their plugins support committed actions; opt in
+with `--committed-actions`. Every new family or adapter must ship with committed-action support, committed
+rows in the worker's native action space, and a test for it
+(`examples/yam/tests/test_holesaw_fine_tuned_families.py` fails when a family in the table lacks one).

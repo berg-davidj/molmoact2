@@ -52,8 +52,10 @@ def checked_chunk(session, cameras, state, instruction, *, episode_start, action
         query_state = None
     queued_joints = committed_actions
     if committed_actions is not None:
-        if matrix_policy:
-            committed_actions = pose_actions.committed(queued_joints)
+        # Committed rows are in the worker's own action space: the queued joint rows for a joint worker,
+        # and the same commands as poses (forward kinematics) for a pose worker.
+        if pose_actions:
+            committed_actions = pose_actions.committed(queued_joints, matrix_policy=matrix_policy)
         if state_padding is not None:
             # The inactive half of the model has the same fixed command as its input state.
             parked = np.broadcast_to(state_padding, (len(committed_actions), len(state_padding)))
@@ -78,7 +80,7 @@ def checked_chunk(session, cameras, state, instruction, *, episode_start, action
 
         # The queued joints already select an IK branch. Solve only the new rows,
         # starting at the last queued target so the step bound holds across the handoff.
-        kept = (queued_joints[:len(chunk)] if matrix_policy and queued_joints is not None
+        kept = (queued_joints[:len(chunk)] if queued_joints is not None
                 else np.empty((0, 7), dtype=np.float32))
         suffix = chunk[len(kept):]
         chunk = kept
