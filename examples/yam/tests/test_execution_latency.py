@@ -149,11 +149,11 @@ class _SpanRecorder:
 
 @pytest.fixture
 def clock(monkeypatch):
-    groot_rollout = pytest.importorskip("groot_rollout")
+    rollout_loop = pytest.importorskip("rollout_loop")
     clock = _Clock()
-    monkeypatch.setattr(groot_rollout, "ThreadPoolExecutor", _InlinePredictor)
-    monkeypatch.setattr(groot_rollout.time, "monotonic", clock.monotonic)
-    monkeypatch.setattr(groot_rollout.time, "sleep", clock.sleep)
+    monkeypatch.setattr(rollout_loop, "ThreadPoolExecutor", _InlinePredictor)
+    monkeypatch.setattr(rollout_loop.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(rollout_loop.time, "sleep", clock.sleep)
     return clock
 
 
@@ -167,10 +167,10 @@ def spans(monkeypatch):
 
 
 def _run(clock, *, session=None, pose=None, env=None, **kwargs):
-    import groot_rollout
+    import rollout_loop
 
     trace = _Trace()
-    groot_rollout.run(env or _Env(), session or _Session(clock), _Mask(), seconds=3, instruction="go",
+    rollout_loop.run(env or _Env(), session or _Session(clock), _Mask(), seconds=3, instruction="go",
                       camera_bindings={"top": "front_camera_rgb"}, history_offsets=(), lead_steps=4,
                       pose_actions=pose or _PoseActions(clock), trace=trace, max_plan_rows=8, model_label="rho",
                       **{"shadow": False, **kwargs})
@@ -178,7 +178,7 @@ def _run(clock, *, session=None, pose=None, env=None, **kwargs):
 
 
 def test_checked_chunk_times_each_stage_and_keeps_ik_out_of_postprocess(clock):
-    from groot_rollout import checked_chunk, command_latency, prediction_latency
+    from rollout_loop import checked_chunk, command_latency, prediction_latency
 
     timings = {}
     submitted_at = clock.now
@@ -204,7 +204,7 @@ def test_checked_chunk_times_each_stage_and_keeps_ik_out_of_postprocess(clock):
 
 
 def test_joint_worker_has_no_ik_stage(clock):
-    from groot_rollout import checked_chunk, prediction_latency
+    from rollout_loop import checked_chunk, prediction_latency
 
     timings = {}
     checked_chunk(_Session(clock), {}, np.zeros(7, np.float32), "go", episode_start=True, timings=timings)
