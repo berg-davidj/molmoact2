@@ -19,6 +19,7 @@ import rerun.blueprint as rrb
 from chunk_fusion import MODES as CHUNK_FUSION_MODES, ChunkPlan
 from gripper_aperture import clip_predicted_aperture
 from rollout_trace import RolloutTrace
+import run_recording
 
 CAMERAS = {"belt": "front_camera_rgb", "wrist": "left_camera_rgb"}
 CONTROL_HZ = 15  # training rate of the YAM checkpoints; one action per 15 Hz step
@@ -39,7 +40,7 @@ def frames_for_policy(obs, camera_shapes, camera_bindings=CAMERAS):
 def checked_chunk(session, cameras, state, instruction, *, episode_start, action_shape=ACTION_SHAPE,
                   model_label="GR00T", gripper_tolerance=None, pose_actions=None, matrix_policy=False,
                   observation_time=None, max_plan_rows=None, history_inputs=None, trace=None, prediction_id=0,
-                  state_padding=None, committed_actions=None, noise_seed=None):
+                  state_padding=None, committed_actions=None, noise_seed=None, observation=None):
     start = time.monotonic()
     query_state = pose_actions.state(state, matrix_policy=matrix_policy) if pose_actions else state
     if state_padding is not None:
@@ -64,8 +65,11 @@ def checked_chunk(session, cameras, state, instruction, *, episode_start, action
     if noise_seed is not None:
         sensors["noise_seed"] = noise_seed
     response = session.predict(cameras=cameras, state=query_state, instruction=instruction,
-                               episode_start=episode_start, **sensors)
+                               episode_start=episode_start, **sensors, **run_recording.predict_link(observation))
     chunk = np.asarray(response.actions, dtype=np.float32)
+    # The chunk id is the rollout's prediction number; link it to the SDK's Prediction record.
+    run_recording.current().chunk(prediction_id, outcome="returned", rows=len(chunk),
+                                  prediction=getattr(session, "last_recorded_prediction", None))
     if trace is not None:
         trace.prediction(prediction_id, response, chunk, session, time.monotonic() - start)
     if chunk.shape != action_shape or not np.isfinite(chunk).all():
@@ -125,6 +129,8 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
     observations = deque()
     rejected_chunks = 0
     rows = predictions = handoffs = misses = holds = 0
+    recorder = run_recording.current()
+    tick = -1
     next_tick = time.monotonic()
     started_at = next_tick
     deadline = next_tick + seconds
@@ -133,7 +139,9 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
         while time.monotonic() < deadline:
             while observations and observations[0].done():
                 observations.popleft().result()
-            obs = env.get_obs()
+            tick += 1
+            with recorder.span("get_obs"):
+                obs = env.get_obs()
             observation_time = time.monotonic() - started_at if timestamp_observations else None
             frames = frames_for_policy(obs, session.grant.io_spec.cameras, camera_bindings)
             history.append(frames)
@@ -156,6 +164,12 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 # observation instead of applying a plan computed before the hold.
                 missed = bool(submitted_with and request_hold_ticks)
                 first_row = None if missed or request_prefix_changed else pending.add(chunk, request_slot)
+                outcome, reason = (("dropped", "unreachable") if not len(chunk) else ("dropped", "missed_boundary")
+                                   if missed else ("dropped", "mask_changed") if request_prefix_changed
+                                   else ("dropped", "stale") if first_row is None else ("accepted", None))
+                recorder.chunk(predictions, outcome=outcome, reason=reason, first_row=first_row,
+                               hold_ticks_while_waiting=request_hold_ticks, queued_rows_at_request=submitted_with,
+                               fusion=chunk_fusion)
                 if trace is not None:
                     if not len(chunk):
                         trace.event("Prediction %d rejected: unreachable plan", predictions)
@@ -194,6 +208,9 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 request_hold_ticks = 0
                 request_prefix_changed = False
                 prefix = pending.committed_actions() if committed_actions and submitted_with else None
+                handle = recorder.observation(prediction=predictions + 1, queued_rows=submitted_with,
+                                              committed_rows=0 if prefix is None else len(prefix),
+                                              lead_steps=lead_steps)
                 if trace is not None:
                     trace.event("Prediction %d requested with %d queued rows", predictions + 1, submitted_with)
                 future = predictor.submit(checked_chunk, session, cameras, measured[:7].copy(),
@@ -203,7 +220,8 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                                           matrix_policy=matrix_policy, observation_time=observation_time,
                                           max_plan_rows=max_plan_rows, history_inputs=history_inputs,
                                           trace=trace, prediction_id=predictions + 1,
-                                          state_padding=state_padding, committed_actions=prefix, noise_seed=noise_seed)
+                                          state_padding=state_padding, committed_actions=prefix, noise_seed=noise_seed,
+                                          observation=handle)
                 predictions += 1
             elif stream_observations:
                 # Use the prediction executor to preserve Session order without blocking the control tick.
@@ -225,6 +243,8 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                     target[:7] = row
                     command = mask.command_target(target, measured)
                     env.step_command_only(command, wait=False)
+                    recorder.commanded(tick, command, chunk=active_prediction, row=row_index,
+                                       clipped=not np.allclose(command[:7], row, rtol=0, atol=1e-6))
                     if committed_actions and future is not None and submitted_with:
                         # The hardware limit takes precedence. Replan from fresh feedback if a conditioned
                         # target had to change, instead of applying a suffix based on a different command.
@@ -236,6 +256,9 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
             elif future is not None:
                 request_hold_ticks += 1
                 holds += 1
+            recorder.tick(tick, chunk=active_prediction if row is not None else None, row=row_index,
+                          held=row is None, reason=None if row is not None else "waiting" if future is not None
+                          else "idle", tick_elapsed_ms=1000 * (time.monotonic() - next_tick + period))
             if trace is not None:
                 trace.tick(measured, row, command, active_prediction, row_index,
                            holding=row is None and future is not None)
