@@ -48,7 +48,10 @@ def checked_chunk(session, cameras, state, instruction, *, episode_start, action
     if history_inputs is not None:
         sensors.update(history_inputs)
         query_state = None
+    queued_joints = committed_actions
     if committed_actions is not None:
+        if matrix_policy:
+            committed_actions = pose_actions.committed(queued_joints)
         if state_padding is not None:
             # The inactive half of the model has the same fixed command as its input state.
             parked = np.broadcast_to(state_padding, (len(committed_actions), len(state_padding)))
@@ -71,11 +74,18 @@ def checked_chunk(session, cameras, state, instruction, *, episode_start, action
     if pose_actions:
         from tool_pose_actions import UnreachableToolPose
 
-        try:
-            chunk = pose_actions.actions(chunk, state, matrix_policy=matrix_policy)
-        except UnreachableToolPose as error:
-            print(f"[{model_label.lower()}] {error}. Holding and replanning.", flush=True)
-            return np.empty((0, 7), dtype=np.float32), time.monotonic() - start
+        # The queued joints already select an IK branch. Solve only the new rows,
+        # starting at the last queued target so the step bound holds across the handoff.
+        kept = (queued_joints[:len(chunk)] if matrix_policy and queued_joints is not None
+                else np.empty((0, 7), dtype=np.float32))
+        suffix = chunk[len(kept):]
+        chunk = kept
+        if len(suffix):
+            try:
+                solved = pose_actions.actions(suffix, kept[-1] if len(kept) else state, matrix_policy=matrix_policy)
+                chunk = np.concatenate((kept, solved))
+            except UnreachableToolPose as error:
+                print(f"[{model_label.lower()}] {error}. Replanning after the queued targets.", flush=True)
     gripper = chunk[:, 6]
     lower, upper = -gripper_tolerance, 1.0 + gripper_tolerance
     if np.any((gripper < lower) | (gripper > upper)):

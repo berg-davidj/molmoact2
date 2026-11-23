@@ -41,6 +41,25 @@ def test_seeded_probe_checks_both_prediction_paths(family):
         assert "noise_seed" not in observations[0]
 
 
+def test_praxis_probe_preserves_the_rotation_and_zero_seed():
+    calls = []
+    pose = np.array([.3, .1, .3, 0, 1, 0, -1, 0, 0, 0, 0, 1, .75], np.float32)
+    actions = np.tile(pose, (24, 1))
+
+    def predict(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(actions=actions)
+
+    host = SimpleNamespace(identity={"state_dim": 8, "action_dim": 13, "action_horizon": 24,
+                                     "camera_mapping": {"top": "exterior", "left": "wrist"}},
+                           supports_committed_actions=lambda: True, begin_episode=lambda: None,
+                           session=SimpleNamespace(predict=predict, grant=SimpleNamespace(
+                               io_spec=SimpleNamespace(cameras={"exterior": (4, 4), "wrist": (4, 4)}))))
+    managed_rollout.probe(host, "praxis1", "pick", committed_actions=True, noise_seed=0)
+    assert [call["noise_seed"] for call in calls] == [0, 0]
+    np.testing.assert_array_equal(calls[-1]["committed_actions"], actions[:1])
+
+
 @pytest.mark.parametrize("family", ["gr00t", "isaac05", "molmoact2"])
 def test_managed_cli_rejects_noise_seed_before_opening_session(family, monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["managed_rollout.py", "--noise-seed", "0"])

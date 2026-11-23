@@ -547,6 +547,21 @@ from this client's `hz` setting.
 
 ## Tool-pose checkpoints on a single arm
 
+For the managed Praxis-1 Holesaw rollout, use the two-camera checkpoint with its
+single-arm flange layout. The three-camera checkpoint needs `--praxis-holesaw-bimanual`.
+It uses the grasp site in rig coordinates, sends the physical left arm and its wrist
+camera to the model's right slot, and holds the physical right arm. To check the
+endpoint before opening the robot, run:
+
+```bash
+examples/yam/run-rollout.sh --deployment DEPLOYMENT_ID --probe --committed-actions --noise-seed 0
+examples/yam/run-rollout.sh --deployment DEPLOYMENT_ID --praxis-holesaw-bimanual --probe --committed-actions --noise-seed 0
+```
+
+The seed selects the same noise draw for each prediction. With committed actions,
+the client sends the queued joint commands as absolute tool poses and starts IK for
+the continuation at the last queued joint target. The per-row joint limit is 0.12 rad.
+
 Select `tool_pose_rot6d` for endpoints that take a seven-value tool state
 (position in meters, axis-angle in radians, and gripper) and return rows of ten
 values (position, the first two rotation-matrix rows, and gripper). The launcher

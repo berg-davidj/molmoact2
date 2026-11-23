@@ -12,6 +12,7 @@ import yaml
 from orchestral import IOSpec
 from orchestral_session_bridge import (
     GR00T_YAM_ADAPTER,
+    PRAXIS_HOLESAW_BIMANUAL,
     TEMPORAL_JOINT_ADAPTER,
     OrchestralBridgeError,
     OrchestralSessionHost,
@@ -20,6 +21,13 @@ from orchestral_session_bridge import (
 
 
 class DeploymentCameraMappingTests(unittest.TestCase):
+    def test_praxis_holesaw_three_camera_working_arm(self):
+        host = OrchestralSessionHost(deployment_id="metadata-only", policy_adapter=PRAXIS_HOLESAW_BIMANUAL)
+        spec = IOSpec(cameras={n: (8, 8) for n in ("top_left", "wrist_left", "wrist_right")},
+                      state_dim=16, action_shape=(24, 26))
+        host._configure(spec)
+        self.assertEqual(host.identity["camera_mapping"], {"top": "top_left", "left": "wrist_right", "right": "wrist_left"})
+
     def test_holesaw_exports_map_named_views(self):
         layouts = [
             (GR00T_YAM_ADAPTER, ("top_left", "wrist_left", "wrist_right")),

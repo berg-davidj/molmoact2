@@ -29,8 +29,8 @@ MOLMOACT2_GRIPPER_TOLERANCE = 0.15
 ISAAC_PARKED_RIGHT_ARM = np.array([0, 0, 0, 0, 0, 0, 1], dtype=np.float32)
 ISAAC_BIMANUAL_CONTROL_HZ = 30  # the release checkpoint's rate; one action per 30 Hz step
 ISAAC_BIMANUAL_PLAN_ROWS = 30   # replan every second instead of running the full 2 s chunk
-COMMITTED_ACTION_FAMILIES = frozenset({"gr00t", "isaac05", "flux3-action", "molmoact2", "longwam"})
-NOISE_SEED_FAMILIES = frozenset({"pi05", "flux3-action", "longwam"})
+COMMITTED_ACTION_FAMILIES = frozenset({"gr00t", "isaac05", "flux3-action", "molmoact2", "longwam", "praxis1"})
+NOISE_SEED_FAMILIES = frozenset({"pi05", "flux3-action", "longwam", "praxis1"})
 
 original_init = ManagedTailnetNode.__init__
 original_run = TailscaleCli.run
@@ -61,6 +61,11 @@ def policy_family(model_id):
 
 def placeholder_state(family, dimension):
     if family == "praxis1":
+        if dimension == 16:
+            from tool_pose_actions import HolesawBimanualActions
+
+            return np.r_[HolesawBimanualActions.parked_state,
+                         np.array([0.7, -0.23, 0.38, 1, 0, 0, 0, 0.5], dtype=np.float32)]
         return np.array([0.3, 0, 0.3, 1, 0, 0, 0, 0.5], dtype=np.float32)
     if family == "verne":
         return np.array([0.3, 0, 0.3, 0, 0, 0, 0.5], dtype=np.float32)
@@ -111,7 +116,8 @@ def probe(host, family, instruction, *, committed_actions=False, noise_seed=None
         if family == "longwam":
             host.session.observe(**predict)
         prefix = actions[:1].copy()
-        prefix[:, 6] = np.clip(prefix[:, 6], 0, 1)
+        if family != "praxis1":
+            prefix[:, 6] = np.clip(prefix[:, 6], 0, 1)
         if family == "isaac05" and expected[1] == 14:
             prefix[:, 7:] = ISAAC_PARKED_RIGHT_ARM
         continued = np.asarray(
@@ -138,7 +144,8 @@ def rollout_joint_policy(host, identity, args):
     family = args.policy_family
     checked_shape = (identity["action_horizon"], identity["action_dim"])
     bimanual_layout = family == "isaac05" and (identity["state_dim"], checked_shape[1]) == (14, 14)
-    state_width, action_width = {"praxis1": (8, 13), "verne": (7, 10)}.get(
+    praxis_bimanual = family == "praxis1" and identity["state_dim"] == 16
+    state_width, action_width = {"praxis1": (16, 26) if praxis_bimanual else (8, 13), "verne": (7, 10)}.get(
         family, (14, 14) if bimanual_layout else (7, 7))
     if identity["state_dim"] != state_width or checked_shape[1] != action_width or checked_shape[0] <= 0:
         raise SystemExit(f"Unexpected {family} contract for YAM: {checked_shape}")
@@ -163,11 +170,12 @@ def rollout_joint_policy(host, identity, args):
         temporal_history = TemporalJointHistory(identity["history_rows"])
     pose_actions = None
     if family in {"praxis1", "verne"}:
-        from tool_pose_actions import ToolPoseActions
+        from tool_pose_actions import HolesawBimanualActions, ToolPoseActions
 
-        pose_actions = ToolPoseActions(
+        adapter = HolesawBimanualActions if praxis_bimanual else ToolPoseActions
+        pose_actions = adapter(
             model_path=Path(__file__).with_name("configs") / "yam_holesaw_kinematics.urdf",
-            base_body="base", tool_body="gripper",
+            base_body="base", tool_body="grasp_site" if praxis_bimanual else "gripper",
             joint_names=[f"joint{i}" for i in range(1, 7)], max_joint_step_rad=0.12,
         )
     left = OmegaConf.to_container(OmegaConf.load(LEFT_CONFIG), resolve=True)
@@ -496,7 +504,7 @@ def soak_endpoint(host, identity, args):
 def main():
     from omegaconf import OmegaConf
     from orchestral_session_bridge import (
-        GR00T_YAM_ADAPTER, TEMPORAL_JOINT_ADAPTER, TOOL_POSE_ADAPTER, TOOL_POSE_MATRIX_ADAPTER,
+        GR00T_YAM_ADAPTER, PRAXIS_HOLESAW_BIMANUAL, TEMPORAL_JOINT_ADAPTER, TOOL_POSE_ADAPTER, TOOL_POSE_MATRIX_ADAPTER,
         OrchestralSessionHost, parse_noise_seed,
     )
 
@@ -507,6 +515,8 @@ def main():
     parser.add_argument("--soak-hours", type=float, default=0.0,
                         help="Run a robot-free live-camera endpoint soak for this many hours")
     parser.add_argument("--noise-seed", type=parse_noise_seed, help="Fixed noise seed for each prediction")
+    parser.add_argument("--praxis-holesaw-bimanual", action="store_true",
+                        help="Use the 3-camera Holesaw grasp-site rig with the working arm in the right policy slot")
     target, rollout_args = parser.parse_known_args()
     if not math.isfinite(target.soak_hours) or target.soak_hours < 0:
         parser.error("--soak-hours must be finite and nonnegative")
@@ -524,6 +534,8 @@ def main():
             parser.error(f"{target.deployment} has no YAM joint-rollout adapter for model {model_id!r}")
     if target.noise_seed is not None and family not in NOISE_SEED_FAMILIES:
         parser.error(f"{family} does not support --noise-seed")
+    if target.praxis_holesaw_bimanual and family != "praxis1":
+        parser.error("--praxis-holesaw-bimanual requires a Praxis-1 checkpoint")
 
     if family == "pi05" and not target.probe and target.soak_hours <= 0:
         sys.argv = [
@@ -584,7 +596,7 @@ def main():
     adapter = {
         "gr00t": GR00T_YAM_ADAPTER,
         "flux3-action": TEMPORAL_JOINT_ADAPTER,
-        "praxis1": TOOL_POSE_MATRIX_ADAPTER,
+        "praxis1": PRAXIS_HOLESAW_BIMANUAL if target.praxis_holesaw_bimanual else TOOL_POSE_MATRIX_ADAPTER,
         "verne": TOOL_POSE_ADAPTER,
         "pi05": "pi05_yam_red_cap" if target.soak_hours <= 0 else "identity",
     }.get(family, "identity")

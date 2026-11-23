@@ -60,6 +60,16 @@ class ToolPoseActions:
             return np.r_[position, quaternion, 1.0 - state[6]].astype(np.float32)
         return np.concatenate((position, self._rotvec(rotation), state[6:])).astype(np.float32)
 
+    def committed(self, joint_targets):
+        """Encode the exact queued joint commands as absolute Praxis pose rows."""
+        data = self._mj.MjData(self.model)
+        rows = []
+        for target in joint_targets:
+            target = self._checked_state(target)
+            position, rotation = self._pose(data, target[:6])
+            rows.append(np.r_[position, rotation.ravel(), 1.0 - target[6]])
+        return np.asarray(rows, dtype=np.float32)
+
     def _solve(self, data, target_position, target_rotation, previous):
         lower = np.maximum(self.lower, previous - self.max_step)
         upper = np.minimum(self.upper, previous + self.max_step)
@@ -118,3 +128,31 @@ class ToolPoseActions:
                 raise UnreachableToolPose(f"Tool action row {i}: {error}") from error
             output[i, :6], output[i, 6] = joints, gripper
         return output
+
+
+class HolesawBimanualActions(ToolPoseActions):
+    """The Holesaw training rig puts the physical working arm in the right policy slot."""
+
+    working_mount = np.array([0.29985, -0.30516, 0.30165])
+    parked_state = np.array([0.06576730, 0.37384747, 0.45302705, -0.13859866,
+                             0.73765181, -0.05479971, -0.65852654, 0.009264], dtype=np.float32)
+
+    def _pose(self, data, joints):
+        position, rotation = super()._pose(data, joints)
+        return self.working_mount + position, rotation
+
+    def state(self, joint_state, *, matrix_policy=True):
+        return np.r_[self.parked_state, super().state(joint_state, matrix_policy=True)]
+
+    def committed(self, joint_targets):
+        working = super().committed(joint_targets)
+        matrix = np.empty(9)
+        self._mj.mju_quat2Mat(matrix, self.parked_state[3:7].astype(np.float64))
+        parked = np.r_[self.parked_state[:3], matrix, self.parked_state[-1]].astype(np.float32)
+        return np.column_stack((np.broadcast_to(parked, (len(working), 13)), working))
+
+    def actions(self, rows, joint_state, *, matrix_policy=True):
+        rows = np.asarray(rows)
+        if rows.ndim != 2 or rows.shape[1] != 26 or not np.isfinite(rows).all():
+            raise ValueError("Bimanual Holesaw actions must have 26 finite values per row")
+        return super().actions(rows[:, 13:], joint_state, matrix_policy=True)

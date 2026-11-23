@@ -91,4 +91,11 @@
     <child link="gripper" />
     <limit effort="1" velocity="1" lower="-2.0944" upper="2.0944" />
   </joint>
+  <!-- Tool used for the 3-camera Holesaw recording (the 2-camera export used the flange). -->
+  <link name="grasp_site" />
+  <joint name="flange_to_grasp_site" type="fixed">
+    <parent link="gripper" />
+    <child link="grasp_site" />
+    <origin xyz="0 0 0.1347" rpy="0 0 1.5707963267948966" />
+  </joint>
 </robot>
