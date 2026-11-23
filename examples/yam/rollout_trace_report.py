@@ -14,6 +14,8 @@ import numpy as np
 import pyarrow as pa
 import rerun.experimental as rr_experimental
 
+from rollout_trace import LATENCY_STAGES
+
 RECORDINGS = Path("yam_eval_runs/rerun")
 JOINTS = slice(0, 6)
 
@@ -86,6 +88,12 @@ def report(path):
         tick_ms = 1000 * np.median(np.diff(times))
         lines.append(f"  prediction latency p50 {np.median(latency):.0f} ms, max {latency.max():.0f} ms "
                      f"({latency.max() / tick_ms:.1f} ticks)")
+    # Response-to-execution stages (recordings made before these were traced have none).
+    for name in (*LATENCY_STAGES, "tick_to_command_ms"):
+        values = np.array([_unwrap(row["Scalars:scalars"]) for row in trace.get(f"/policy/latency/{name}", [])])
+        if len(values):
+            lines.append(f"  {name:<27} p50 {np.median(values):6.1f} ms, p95 {np.percentile(values, 95):6.1f} ms, "
+                         f"max {values.max():6.1f} ms")
     return "\n".join(lines)
 
 

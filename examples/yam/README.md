@@ -385,7 +385,20 @@ PYTHONPATH=examples/yam python examples/yam/rtc_rollout.py \
 ### Metrics
 
 Metrics for hosted (`server` mode) deployments are in the official Grafana at
-https://grafana.orchestrallabs.ai (Clerk SSO). This repo collects no metrics itself.
+https://grafana.orchestrallabs.ai (Clerk SSO). Apart from the span below, this repo
+collects no metrics itself.
+
+The joint rollouts in `managed_rollout.py` (every family except Pi0.5) call the Worker
+directly, so the SDK sends no control-loop spans for them. They record one
+`yam.rollout.response_to_command` span per accepted prediction instead. Its duration
+runs from the Worker's response to the first new row sent to the robot. Its
+`yam.rollout.*_ms` attributes split that time and the steps before it: request
+preparation (forward kinematics for tool-pose models), the Worker call, IK, the wait
+for the control loop, and the observation-to-command total. The span carries the
+Session's `orc.*` attributes and goes out through the same relay and the same
+`ORC_TELEMETRY_*` variables as the SDK's own spans. The same stages are in the Rerun
+recording under `/policy/latency`, in the end-of-run summary, and in
+`rollout_trace_report.py`.
 
 ## Hardware setup
 
