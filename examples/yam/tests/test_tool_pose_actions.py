@@ -47,7 +47,28 @@ class ToolPoseActionsTests(unittest.TestCase):
                                   action_shape=(2, 26), pose_actions=adapter, matrix_policy=True,
                                   committed_actions=queued, noise_seed=0)
         np.testing.assert_array_equal(result[:1], queued)
-        np.testing.assert_allclose(adapter.committed(result[1:]), adapter.committed(target), atol=2e-5)
+        # The solver stops at 0.2 mm and 0.002 rad (a tenth of its tolerances), so poses match to about 1e-3.
+        np.testing.assert_allclose(adapter.committed(result[1:]), adapter.committed(target), atol=2e-3)
+
+    def test_a_run_starts_from_the_near_singular_zero_pose_without_truncating_the_chunk(self):
+        adapter = HolesawBimanualActions(
+            model_path=Path(__file__).resolve().parents[1] / "configs/yam_holesaw_kinematics.urdf",
+            base_body="base", tool_body="grasp_site", joint_names=[f"joint{i}" for i in range(1, 7)],
+            max_joint_step_rad=0.12,
+        )
+        # The arm starts a run near all-zero joints. Unfolding the wrist there takes more than the 0.12 rad
+        # per-row bound but less than the 0.2 rad per tick the executor follows, so a plan must not stop early.
+        start = np.array([0.0, 0.02, 0.01, -0.06, 0.0, 0.0, 0.0], dtype=np.float32)
+        path = [start.copy()]
+        for _ in range(7):
+            step = path[-1].copy()
+            step[4] += 0.18
+            step[3] += 0.03
+            path.append(step)
+        rows = adapter.committed(np.array(path[1:]))
+        solved = adapter.actions(rows, start)
+        self.assertEqual(len(solved), len(rows))
+        np.testing.assert_allclose(solved[:, :6], np.array(path[1:])[:, :6], atol=2e-2)
 
     def test_round_trip_and_reject_unreachable_action(self):
         # A six-joint chain with a fixed tool offset and a full-rank workspace.

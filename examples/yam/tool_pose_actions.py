@@ -325,9 +325,20 @@ class HolesawBimanualActions(ToolPoseActions):
     # commands), so it needs the same generous cap as QuatToolPoseActions; the executor's per-tick cap
     # (both_arm_max_delta) limits the actual motion. Later rows keep the per-row step bound.
     first_row_max_step_rad = 1.0
+    # The arm starts a run near all-zero joints, a near-singular pose (smallest tool-Jacobian singular value 0.046,
+    # against 0.125 mid-workspace): unfolding the wrist takes 0.2-0.27 rad in rows 2-4, past the 0.12 rad per-row bound,
+    # so a cold-start chunk stopped after 1-4 rows (or 0) and was replanned. The executor follows up to 0.2 rad per
+    # tick (both_arm_max_delta), so the plan may use that; at this pose the solver also lands 3-4 mm from a target,
+    # past the default 2 mm acceptance. On 14 real Holesaw starts this solves all 24 rows (worst error 3.2 mm).
+    step_floor_rad = 0.2
+    accept_norm = 2
     working_mount = np.array([0.29985, -0.30516, 0.30165])
     parked_state = np.array([0.06576730, 0.37384747, 0.45302705, -0.13859866,
                              0.73765181, -0.05479971, -0.65852654, 0.009264], dtype=np.float32)
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.max_step = max(self.max_step, self.step_floor_rad)
 
     def _pose(self, data, joints):
         position, rotation = super()._pose(data, joints)
