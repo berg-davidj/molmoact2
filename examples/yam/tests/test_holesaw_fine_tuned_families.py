@@ -273,6 +273,7 @@ def test_policy_family_selection(model, family):
     ("dreamzero", dict(state_dim=7, action_dim=7, action_horizon=24), 15, 8, 24),
     ("fastwam", dict(state_dim=7, action_dim=7, action_horizon=32), 15, 8, 32),
     ("dw05", dict(state_dim=7, action_dim=7, action_horizon=32), 15, 4, 16),
+    ("praxis1", dict(state_dim=16, action_dim=26, action_horizon=24), 15, 4, 24),
     ("gr00t", dict(state_dim=7, action_dim=7, action_horizon=16), 15, 8, 16),
     ("longwam", dict(state_dim=7, action_dim=7, action_horizon=32), 30, 16, 32),
 ])
