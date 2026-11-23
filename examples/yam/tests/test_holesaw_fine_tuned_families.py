@@ -133,6 +133,29 @@ def test_a_chunk_is_solved_row_by_row_with_a_bounded_step_and_clipped_gripper():
     np.testing.assert_allclose(solved[:, 6], np.clip(rows[:, 7], 0, 1), atol=1e-6)
 
 
+def test_the_first_row_may_lead_the_measured_joints_but_later_rows_stay_step_bounded():
+    # In the 30 Hz Holesaw data the first action row is more than 0.06 rad from the measured joints in 59% of frames
+    # (actions are leader commands), so row 0 must not be held to the per-row step bound.
+    ik = adapter()
+    measured = CONFIGS[0]
+    lead = np.array([0.3, -0.2, 0.1, 0.2, 0.25, -0.2, 0.0])
+    path = np.linspace(measured + lead, measured + lead + np.array([0.2, 0.1, -0.1, 0.05, 0.1, 0.1, 0.0]), 32)
+    rows = np.stack([ik.state(joint) for joint in path]).astype(np.float64)
+    solved = ik.actions(rows, measured)
+    assert solved.shape == (32, 7)
+    np.testing.assert_allclose(solved[:, :6], path[:, :6], atol=1e-3)
+    assert np.max(np.abs(solved[0, :6] - measured[:6])) > 0.06
+    assert np.max(np.abs(np.diff(solved[:, :6], axis=0))) <= 0.06 + 1e-6
+
+    class StrictFirstRow(QuatToolPoseActions):
+        first_row_max_step_rad = 0.06
+
+    strict = StrictFirstRow(model_path=URDF, base_body="base", tool_body="rho_tool", joint_names=JOINTS,
+                            max_joint_step_rad=0.06)
+    with pytest.raises(UnreachableToolPose, match="row 0"):
+        strict.actions(rows, measured)
+
+
 def test_a_fixed_base_transform_moves_both_state_and_targets():
     rotation = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1.0]])
     shifted = adapter(base_rotation=rotation, base_translation=[0.3, -0.3, 0.3])

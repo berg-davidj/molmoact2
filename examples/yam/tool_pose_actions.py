@@ -84,9 +84,10 @@ class ToolPoseActions:
                 rows.append(np.r_[position, rotation[:2].ravel(), target[6]])
         return np.asarray(rows, dtype=np.float32)
 
-    def _solve(self, data, target_position, target_rotation, previous):
-        lower = np.maximum(self.lower, previous - self.max_step)
-        upper = np.minimum(self.upper, previous + self.max_step)
+    def _solve(self, data, target_position, target_rotation, previous, max_step=None):
+        max_step = self.max_step if max_step is None else max_step
+        lower = np.maximum(self.lower, previous - max_step)
+        upper = np.minimum(self.upper, previous + max_step)
         if np.any(lower >= upper):
             raise UnreachableToolPose("No joint target lies within both the joint limits and step bound")
         from scipy.optimize import least_squares
@@ -157,6 +158,11 @@ class QuatToolPoseActions(ToolPoseActions):
     position_tolerance = 0.0002
     rotation_tolerance = 0.002
     accept_norm = 10
+    # Row 0 is solved from the MEASURED joints, which lag the model's first command: in the 30 Hz Holesaw data the first
+    # action row is more than 0.06 rad from the measured joints in 59% of frames (p99 0.40 rad), because actions are leader
+    # commands. Row 0 is therefore bounded only by the joint limits and this generous cap; the executor's per-tick clamp
+    # limits the actual motion. Later rows keep the per-row step bound (consecutive rows are one control tick apart).
+    first_row_max_step_rad = 1.0
 
     def __init__(self, *, base_rotation=None, base_translation=None, **kwargs):
         super().__init__(**kwargs)
@@ -203,7 +209,8 @@ class QuatToolPoseActions(ToolPoseActions):
             # MuJoCo orders quaternions w, x, y, z.
             self._mj.mju_quat2Mat(matrix, np.r_[row[6], row[3:6]] / norm)
             try:
-                joints = self._solve(data, row[:3], matrix.reshape(3, 3), joints)
+                joints = self._solve(data, row[:3], matrix.reshape(3, 3), joints,
+                                     max_step=max(self.max_step, self.first_row_max_step_rad) if i == 0 else None)
             except UnreachableToolPose as error:
                 if i:
                     return output[:i].copy()
