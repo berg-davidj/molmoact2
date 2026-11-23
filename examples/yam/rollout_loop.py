@@ -265,7 +265,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
         action_shape=ACTION_SHAPE, model_label="GR00T", gripper_tolerance=None, pose_actions=None, matrix_policy=False,
         timestamp_observations=False, max_plan_rows=None, temporal_history=None, trace=None,
         state_padding=None, chunk_fusion="splice", fusion_rows=4, committed_actions=False,
-        stream_observations=False, noise_seed=None):
+        stream_observations=False, noise_seed=None, max_observed_rows=None):
     if committed_actions and (chunk_fusion != "splice" or lead_steps < 1):
         raise ValueError("Committed actions require splice and at least one prefetch lead step")
     period = 1 / control_hz
@@ -289,6 +289,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
     rejected_chunks = 0
     rows = predictions = handoffs = misses = holds = 0
     call_ms, stage_rows = [], []
+    observed_since_prediction = 0
     next_tick = time.monotonic()
     started_at = next_tick
     deadline = next_tick + seconds
@@ -396,14 +397,18 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                                           state_padding=state_padding, committed_actions=prefix, noise_seed=noise_seed,
                                           timings=request_timings)
                 predictions += 1
+                observed_since_prediction = 0
             elif stream_observations:
                 # Use the prediction executor to preserve Session order without blocking the control tick.
                 # It also runs a pose worker's forward kinematics, so the command below does not wait for it;
                 # the single worker thread never uses pose_actions from two threads at once.
-                observations.append(predictor.submit(
-                    observe, session, frames, measured[:7].copy(), instruction,
-                    pose_actions=pose_actions, matrix_policy=matrix_policy,
-                ))
+                # `max_observed_rows` bounds the frames sent between two predictions: see managed_rollout.
+                if max_observed_rows is None or observed_since_prediction < max_observed_rows:
+                    observed_since_prediction += 1
+                    observations.append(predictor.submit(
+                        observe, session, frames, measured[:7].copy(), instruction,
+                        pose_actions=pose_actions, matrix_policy=matrix_policy,
+                    ))
 
             next_tick += period
             row = command = row_index = tick_ms = None

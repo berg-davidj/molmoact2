@@ -221,6 +221,41 @@ def test_rollout_commits_the_queued_targets_before_appending_a_suffix(bimanual, 
             assert prediction_kwargs["noise_seed"] == noise_seed
 
 
+def test_rollout_bounds_the_frames_observed_between_predictions(monkeypatch):
+    rollout_loop = pytest.importorskip("rollout_loop")
+    monkeypatch.setattr(rollout_loop, "ThreadPoolExecutor", _InlinePredictor)
+    clock = iter(np.arange(0, 1000, 0.001))
+    monkeypatch.setattr(rollout_loop.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(rollout_loop.time, "sleep", lambda seconds: None)
+
+    def longest_observed_run(**limits):
+        env, session = _Env(), _Session()
+        events, in_predict = [], []
+        observe, predict = session.observe, session.predict
+
+        def counted_observe(**kwargs):
+            if not in_predict:
+                events.append("o")
+            observe(**kwargs)
+
+        def counted_predict(**kwargs):
+            events.append("p")
+            in_predict.append(True)
+            try:
+                return predict(**kwargs)
+            finally:
+                in_predict.clear()
+
+        session.observe, session.predict = counted_observe, counted_predict
+        rollout_loop.run(env, session, _Mask(), seconds=1.0, instruction="go", shadow=False,
+                          camera_bindings={"top": "front_camera_rgb"}, history_offsets=(), lead_steps=4,
+                          action_shape=(16, 7), committed_actions=True, stream_observations=True, **limits)
+        return max(len(run) for run in "".join(events).split("p"))
+
+    assert longest_observed_run() > 3
+    assert longest_observed_run(max_observed_rows=3) == 3
+
+
 def test_checked_chunk_clips_flux_gripper_overshoot_before_queueing():
     import rollout_loop
 
