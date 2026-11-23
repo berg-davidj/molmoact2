@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from chunk_fusion import MODES as CHUNK_FUSION_MODES
+from rollout_compare import record_settings
 from orchestral import Orchestral
 from orchestral.core.tailnet import ManagedTailnetNode, TailscaleCli
 
@@ -202,6 +203,13 @@ def rollout_joint_policy(host, identity, args):
         Path("yam_eval_runs/rerun") / f"{args.deployment}_{datetime.now().astimezone():%Y%m%d_%H%M%S}.rrd"
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    # What rollout_compare.py groups runs by when it ranks the settings tried.
+    record_settings(output_path, dict(
+        deployment=args.deployment, family=args.policy_family, control_hz=args.control_hz,
+        chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows,
+        prefetch_lead_steps=lead_steps, committed_actions=args.committed_actions,
+        execution_mode="shadow" if args.shadow else "active_arm_hold",
+        seconds=args.seconds, noise_seed=args.noise_seed, instruction=args.instruction))
     sensor_roles = {
         "top": "front_camera_rgb",
         "left": "left_camera_rgb",
@@ -239,7 +247,9 @@ def rollout_joint_policy(host, identity, args):
                         camera, frame, timestamp,
                     ),
                 )
+                trace = None
                 try:
+                    trace = rollout["RolloutTrace"](recording, recording_start, host.session)
                     rollout["run"](
                         env, host.session, mask, seconds=args.seconds, instruction=args.instruction,
                         shadow=args.shadow, lead_steps=lead_steps,
@@ -252,12 +262,16 @@ def rollout_joint_policy(host, identity, args):
                         chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows,
                         state_padding=ISAAC_PARKED_RIGHT_ARM if bimanual_layout else None,
                         gripper_tolerance=MOLMOACT2_GRIPPER_TOLERANCE if family == "molmoact2" else 0.05,
-                        trace=rollout["RolloutTrace"](recording, recording_start, host.session),
+                        trace=trace,
                         committed_actions=args.committed_actions, stream_observations=family == "longwam",
                         noise_seed=args.noise_seed,
                     )
                 finally:
-                    env.close()
+                    try:
+                        env.close()
+                    finally:
+                        if trace is not None:
+                            trace.stop()
     finally:
         recording.disconnect()
     print(f"[rerun] Saved {', '.join(f'{name}={count}' for name, count in frame_counts.items())} frames to {output_path}",

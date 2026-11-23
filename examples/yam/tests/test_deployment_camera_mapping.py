@@ -53,6 +53,8 @@ class DeploymentCameraMappingTests(unittest.TestCase):
             ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"),
             ("observation/images/top_cam", "observation/images/left_cam", "observation/images/right_cam"),
             ("top_camera-images-rgb_320_240", "left_camera-images-rgb_320_240", "right_camera-images-rgb_320_240"),
+            # GR00T hole-saw layout: top_left is the overhead camera on this rig.
+            ("top_left", "wrist_left", "wrist_right"),
         ]
         views = {"top": 17, "left": 83, "right": 191}
         for names in layouts:
@@ -111,6 +113,8 @@ class DeploymentCameraMappingTests(unittest.TestCase):
             ("camera_0", "camera_1", "camera_2"),
             ("top", "exterior_image_0_left", "right"),
             ("top", "top_left_wrist", "right"),
+            ("top_left", "left", "right"),
+            ("top", "top_left", "wrist_right"),
             ("top", "left", "right", "depth_view"),
         ]
         for names in layouts:

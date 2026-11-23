@@ -17,6 +17,7 @@ import rerun as rr
 import rerun.blueprint as rrb
 
 from chunk_fusion import MODES as CHUNK_FUSION_MODES, ChunkPlan
+from rollout_trace import RolloutTrace
 
 CAMERAS = {"belt": "front_camera_rgb", "wrist": "left_camera_rgb"}
 CONTROL_HZ = 15  # training rate of the YAM checkpoints; one action per 15 Hz step
@@ -150,7 +151,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                     chunk, elapsed = future.result()
                 except Exception as error:
                     if trace is not None:
-                        trace.event(f"Prediction {predictions} failed: {error}")
+                        trace.event("Prediction %d failed: %s", predictions, error)
                     raise
                 future = None
                 # Each command sent since the request corresponds to one row of the new
@@ -161,15 +162,15 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 first_row = None if missed or request_prefix_changed else pending.add(chunk, request_slot)
                 if trace is not None:
                     if not len(chunk):
-                        trace.event(f"Prediction {predictions} rejected: unreachable plan")
+                        trace.event("Prediction %d rejected: unreachable plan", predictions)
                     elif missed:
-                        trace.event(f"Prediction {predictions} dropped after {request_hold_ticks} hold ticks")
+                        trace.event("Prediction %d dropped after %d hold ticks", predictions, request_hold_ticks)
                     elif request_prefix_changed:
-                        trace.event(f"Prediction {predictions} dropped after the safety mask changed a committed target")
+                        trace.event("Prediction %d dropped after the safety mask changed a committed target", predictions)
                     elif first_row is None:
-                        trace.event(f"Prediction {predictions} dropped: every row was stale")
+                        trace.event("Prediction %d dropped: every row was stale", predictions)
                     else:
-                        trace.event(f"Prediction {predictions} accepted starting at row {first_row}")
+                        trace.event("Prediction %d accepted starting at row %d", predictions, first_row)
                 if len(chunk):
                     rejected_chunks = 0
                 else:
@@ -198,7 +199,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 request_prefix_changed = False
                 prefix = pending.committed_actions() if committed_actions and submitted_with else None
                 if trace is not None:
-                    trace.event(f"Prediction {predictions + 1} requested with {submitted_with} queued rows")
+                    trace.event("Prediction %d requested with %d queued rows", predictions + 1, submitted_with)
                 future = predictor.submit(checked_chunk, session, cameras, measured[:7].copy(),
                                           instruction, episode_start=(predictions == 0),
                                           action_shape=action_shape, model_label=model_label,
@@ -240,8 +241,6 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                            holding=row is None and future is not None)
             time.sleep(max(0, next_tick - time.monotonic()))
     finally:
-        if trace is not None:
-            trace.stop()
         predictor.shutdown(wait=False, cancel_futures=True)
     print(f"{model_label} rollout finished. {predictions} predictions, {rows} {'shadow rows' if shadow else 'commands'}, "
           f"{handoffs} prefetched handoffs, {misses} missed boundaries, {holds} hold ticks.")
@@ -269,65 +268,6 @@ def record_camera_frame(recording, camera_paths, frame_counts, count_lock, start
     )
     with count_lock:
         frame_counts[model_camera] += 1
-
-
-class RolloutTrace:
-    """Record policy responses and control ticks on the camera timeline."""
-
-    def __init__(self, recording, start_time, session):
-        self.recording = recording
-        self.start_time = start_time
-        self._response_lock = threading.Lock()
-        self._stopped = False
-        names = [f"{arm} joint {joint}" if joint < 7 else f"{arm} aperture"
-                 for arm in ("left", "right") for joint in range(1, 8)]
-        for path in ("measured", "command_sent"):
-            recording.log(f"/robot/{path}", rr.SeriesLines(names=names), static=True)
-        recording.log("/robot/planned_left", rr.SeriesLines(names=names[:7]), static=True)
-        encoder = getattr(session, "encoder_label", None) or getattr(session, "encoder", "unknown")
-        recording.log("/policy/encoder", rr.TextDocument(str(encoder)), static=True)
-
-    def _set_time(self):
-        self.recording.set_time("elapsed", duration=time.monotonic() - self.start_time)
-
-    def prediction(self, prediction_id, response, chunk, session, elapsed):
-        with self._response_lock:
-            if self._stopped:
-                return
-            self._set_time()
-            self.recording.log("/policy/latency/client_ms", rr.Scalars(elapsed * 1000))
-            timings = getattr(response, "timings", None)
-            for field, label in (("accel_exec_us", "model_ms"), ("net_wire_us", "network_ms"),
-                                 ("encode_us", "encode_ms")):
-                duration = getattr(timings, field, None)
-                if duration is not None:
-                    self.recording.log(f"/policy/latency/{label}", rr.Scalars(duration / 1000))
-            sizes = getattr(session, "payload_sizes", None)
-            if sizes and (request_bytes := sizes[-1].get("request_bytes")) is not None:
-                self.recording.log("/policy/upload/request_bytes", rr.Scalars(request_bytes))
-            if chunk.ndim == 2 and chunk.size:
-                self.recording.log("/policy/raw_actions", rr.Tensor(chunk, dim_names=["row", "action"]),
-                                   rr.AnyValues(prediction_id=prediction_id))
-            self.recording.log("/policy/events", rr.TextLog(f"Prediction {prediction_id} received"))
-
-    def event(self, message):
-        self._set_time()
-        self.recording.log("/policy/events", rr.TextLog(message))
-
-    def tick(self, measured, row, command, prediction_id, row_index, *, holding):
-        self._set_time()
-        self.recording.log("/robot/measured", rr.Scalars(measured))
-        self.recording.log("/policy/holding", rr.Scalars(int(holding)))
-        if row is not None:
-            self.recording.log("/robot/planned_left", rr.Scalars(row),
-                               rr.AnyValues(prediction_id=prediction_id, row_index=row_index))
-        if command is not None:
-            self.recording.log("/robot/command_sent", rr.Scalars(command),
-                               rr.AnyValues(prediction_id=prediction_id, row_index=row_index))
-
-    def stop(self):
-        with self._response_lock:
-            self._stopped = True
 
 
 def record_blueprint(camera_bindings, *, control_trace=False):
@@ -431,13 +371,19 @@ def main():
                         camera, frame, timestamp,
                     ),
                 )
+                trace = None
                 try:
+                    trace = RolloutTrace(recording, recording_start, session)
                     run(env, session, mask, seconds=args.seconds, instruction=args.instruction, shadow=args.shadow,
                         lead_steps=args.prefetch_lead_steps,
                         chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows,
-                        trace=RolloutTrace(recording, recording_start, session))
+                        trace=trace)
                 finally:
-                    env.close()
+                    try:
+                        env.close()
+                    finally:
+                        if trace is not None:
+                            trace.stop()
         finally:
             recording.disconnect()
         print(f"[rerun] Saved {', '.join(f'{name}={count}' for name, count in frame_counts.items())} frames to {output_path}",

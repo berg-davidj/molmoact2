@@ -321,6 +321,24 @@ Worker, using an SDK with `Session.observe`.
 predictions for pi0.5, FLUX.3 Action, and Long-WAM, including in `--probe`.
 Omit it to leave the Worker's sampling behavior at its default.
 
+`--chunk-fusion {splice,crossfade,ensemble,rail}` and `--fusion-rows N` also apply
+to pi0.5. There the default `splice` is real-time chunking unchanged; the other
+modes reshape the rows after each takeover, and the fused rows are the ones the
+next prediction is told were committed.
+
+Every rollout saves its settings next to its recording (`<run>.run.json`). To find
+which settings work best, score each run and compare them:
+
+```bash
+python examples/yam/rollout_compare.py score --placed 2 --time 48 --drops 1   # the newest run
+python examples/yam/rollout_compare.py                                        # rank the combinations
+```
+
+Combinations are ranked per deployment by objects placed, then by time. The
+motion measures (arm shake, tracking error, seam, capped and held ticks, grasps,
+prediction latency, observation age and how far fusion moved the commands) explain
+a result; `rollout_compare.py --help` describes each.
+
 ```bash
 examples/yam/run-rollout.sh --deployment <deployment-id> --probe
 ```

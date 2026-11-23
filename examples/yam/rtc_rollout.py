@@ -37,6 +37,7 @@ import logging
 import sys
 import time
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -46,8 +47,11 @@ from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from chunk_fusion import MODES as CHUNK_FUSION_MODES, ChunkPlan  # noqa: E402
 from frame_capture_time import session_capture_time  # noqa: E402
 from orchestral_session_bridge import OrchestralDirectHost, OrchestralSessionHost, parse_noise_seed  # noqa: E402
+from rollout_compare import record_settings  # noqa: E402
+from rollout_trace import RolloutTrace  # noqa: E402
 from rtc_camera_frames import RtcCameraFrames, frame_times  # noqa: E402
 
 logger = logging.getLogger("rtc_rollout")
@@ -143,8 +147,55 @@ class VerifiedCommittedSession:
         return getattr(self._session, name)
 
 
+class RtcChunkFusion:
+    """Fuse each chunk that takes over into the rows still queued from the chunk before it.
+
+    Real-time chunking already joins chunks without a jump: a new chunk starts with the rows the
+    arm ran while it was predicted. A fusing mode (``chunk_fusion.py``) additionally reshapes the
+    rows after the takeover. The fused rows replace the chunk's own rows, so the rows the arm
+    runs, and the rows the next prediction is told were committed, are the fused ones.
+
+    Rows are fused as absolute robot targets, because each red-cap chunk is expressed relative
+    to its own query state. Only the joint columns are written back.
+    """
+
+    def __init__(self, mode: str, fusion_rows: int, to_robot):
+        self.mode = mode
+        self.fusion_rows = fusion_rows
+        self._to_robot = to_robot
+        self.fused = 0  # chunks whose rows were fused with the plan before them
+        self.reset()
+
+    def reset(self):
+        """Forget the queued rows: after a hold or a failure the next chunk starts a new plan."""
+        self._plan = ChunkPlan(self.mode, blend_rows=self.fusion_rows)
+
+    def sent(self):
+        """One row went to the arm."""
+        if len(self._plan):
+            self._plan.pop()
+
+    def fuse(self, chunk, rows_run: int, *, after_hold: bool):
+        """The chunk with its rows from ``rows_run`` on replaced by the fused plan."""
+        query_state = chunk.meta["query_state"]
+        if after_hold:
+            self.reset()  # the arm held its last target; do not blend toward rows it never ran
+        continued = len(self._plan) > 0
+        absolute = self._to_robot(chunk.actions, query_state)
+        if self._plan.add(absolute, self._plan.slot - rows_run) is None:
+            self.reset()
+            return chunk
+        planned = self._plan.committed_actions()  # the queued rows: `rows_run` onward
+        offset = self._to_robot(np.zeros_like(absolute[:1]), query_state)[0, :-1]
+        fused = np.array(chunk.actions, dtype=np.float32, copy=True)
+        fused[rows_run:, :-1] = planned[:, :-1] - offset
+        self.fused += continued
+        return chunk._replace(actions=fused)
+
+
 def make_chunking(session: Any, control_hz: float, *, s_min: int, d_init: int, rebase_joints: int,
-                  telemetry: RolloutTelemetry | None = None):
+                  telemetry: RolloutTelemetry | None = None, fusion: RtcChunkFusion | None = None,
+                  record_prediction=None):
     """``RealTimeChunking`` for this rig.
 
     The red-cap endpoint predicts joint *deltas* from the state it was queried with. Committed
@@ -152,6 +203,8 @@ def make_chunking(session: Any, control_hz: float, *, s_min: int, d_init: int, r
     old query state to the new one (the gripper is absolute and stays as is).
     """
     from orchestral import RealTimeChunking
+
+    action_shape = tuple(session.grant.io_spec.action_shape)
 
     class YamRealTimeChunking(RealTimeChunking):
         def _frozen_rows(self, s):
@@ -171,9 +224,31 @@ def make_chunking(session: Any, control_hz: float, *, s_min: int, d_init: int, r
 
         def _deliver(self, chunk):
             late_before = self.late
+            if chunk.error is None and (np.shape(chunk.actions) != action_shape
+                                        or not np.isfinite(chunk.actions).all()):
+                chunk = chunk._replace(actions=(), error=ValueError(
+                    f"RTC prediction must contain finite actions with shape {action_shape}"))
             delivered = super()._deliver(chunk)
+            late = self.late > late_before
+            raw = delivered
+            if fusion is not None:
+                if chunk.error is not None:
+                    fusion.reset()
+                else:
+                    try:
+                        delivered = fusion.fuse(delivered, self.k[-1], after_hold=late)
+                    except Exception as error:
+                        # The SDK's delivery hook runs outside its prediction error handler.
+                        fusion.reset()
+                        self.actions.clear()
+                        chunk = delivered = chunk._replace(actions=(), error=error)
             if telemetry is not None:
-                telemetry.predictions.append((chunk, self.late > late_before))
+                telemetry.predictions.append((chunk, late))
+            if record_prediction is not None and chunk.error is None:
+                try:
+                    record_prediction(raw)
+                except Exception:
+                    logger.exception("Could not record RTC prediction %d", chunk.seq)
             return delivered
 
     return YamRealTimeChunking(session, control_hz, s_min=s_min, d_init=d_init)
@@ -201,18 +276,39 @@ def next_row(chunking, telemetry: RolloutTelemetry, max_prediction_failures: int
 
 def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_init: int,
         seconds: float, telemetry: RolloutTelemetry, max_prediction_failures: int = 0,
-        camera_frames: RtcCameraFrames | None = None, noise_seed: int | None = None) -> dict:
+        camera_frames: RtcCameraFrames | None = None, noise_seed: int | None = None,
+        trace: RolloutTrace | None = None, chunk_fusion: str = "splice", fusion_rows: int = 4) -> dict:
     """The control loop: one row per tick, one prediction in flight, until ``seconds`` or Ctrl-C."""
     endpoint_dim = host.identity["state_dim"]
+    fusion = None
+    if chunk_fusion != "splice":  # splice is real-time chunking as the SDK runs it
+        if host.identity["action_dim"] != ARM_DIM:
+            raise SystemExit(f"--chunk-fusion {chunk_fusion} needs a single-arm ({ARM_DIM}-wide) endpoint: "
+                             "the fusion treats only the last column as a gripper")
+        fusion = RtcChunkFusion(chunk_fusion, fusion_rows, host.robot_actions)
+    active_arm = slice(0, ARM_DIM) if mask.active_arm_side == "left" else slice(ARM_DIM, 2 * ARM_DIM)
     if endpoint_dim == ARM_DIM:
-        endpoint = slice(0, ARM_DIM) if mask.active_arm_side == "left" else slice(ARM_DIM, 2 * ARM_DIM)
+        endpoint = active_arm
     else:
         endpoint = slice(0, endpoint_dim)
     red_cap = host.policy_adapter == "pi05_yam_red_cap"
     session = host.session
     prediction_cameras = {role: RIG_CAMERAS[role] for role in host.identity["camera_mapping"]}
+    record_prediction = None
+    if trace is not None:
+        def prepare_actions(chunk):
+            actions = host.robot_actions(chunk.actions, chunk.meta["query_state"])
+            if actions.shape[-1] == 2 * ARM_DIM:
+                actions = actions[:, active_arm]
+            return actions
+
+        # The SDK calls this with actions.lock held. Convert to absolute targets on the writer.
+        def record_prediction(chunk):
+            trace.prediction(chunk.seq, None, chunk, session, chunk.t_completed - chunk.t_sent,
+                             prepare_chunk=prepare_actions)
     chunking = make_chunking(VerifiedCommittedSession(session), control_hz, s_min=s_min, d_init=d_init,
-                             rebase_joints=6 if red_cap else 0, telemetry=telemetry)
+                             rebase_joints=6 if red_cap else 0, telemetry=telemetry, fusion=fusion,
+                             record_prediction=record_prediction)
     # An SDK that measures its control-loop latencies from the capture time takes it as
     # `t_captured`; an older one does not know the argument, and it stays in `meta` only.
     sdk_takes_capture_time = "t_captured" in inspect.signature(chunking.observations.put).parameters
@@ -227,15 +323,24 @@ def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_i
         with chunking.actions.lock:
             row = next_row(chunking, telemetry, max_prediction_failures)
             if row is not None:
-                query_state = chunking.rows.chunk.meta["query_state"]
+                chunk = chunking.rows.chunk
+                query_state = chunk.meta["query_state"]
+                row_index = chunking.rows.tick - chunk.tick
+                if fusion is not None:
+                    fusion.sent()
         measured = mask.validate_state(env.get_robot_state()["joint_positions"], name="measured_state")
         if row is None:
             telemetry.hold_ticks += 1  # first chunk, late or failed prediction: keep the last target
+            if trace is not None:
+                trace.tick(measured, None, None, 0, 0, holding=True)
         else:
             target = measured.copy()
             target[endpoint] = host.robot_actions(row, query_state)
-            env.step_command_only(mask.command_target(target, measured), wait=False)
+            command = mask.command_target(target, measured)
+            env.step_command_only(command, wait=False)
             sent += 1
+            if trace is not None:
+                trace.tick(measured, target[active_arm], command, chunk.seq, row_index, holding=False)
         if chunking.should_replan():
             meta = {}
             frames = None
@@ -283,7 +388,8 @@ def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_i
         time.sleep(max(0.0, chunking.t_next - session.clock.now()))
     return {"rows_sent": sent, "hold_ticks": telemetry.hold_ticks,
             "failed_predictions": telemetry.failed_predictions, "late_chunks": chunking.late,
-            "delays_ticks": list(chunking.delays), "rows_run_before_takeover": list(chunking.k)}
+            "delays_ticks": list(chunking.delays), "rows_run_before_takeover": list(chunking.k),
+            "chunk_fusion": chunk_fusion, "fused_chunks": 0 if fusion is None else fusion.fused}
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -306,9 +412,17 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument("--s-min", type=int, default=7, help="rows of a chunk to run before the next request")
     parser.add_argument("--d-init", type=int, default=2, help="prediction delay in ticks until one is measured")
     parser.add_argument("--seconds", type=float, default=60.0, help="rollout length")
+    parser.add_argument("--rrd", type=Path,
+                        help="control trace recording (default: yam_eval_runs/rerun/<deployment>_<timestamp>.rrd)")
     parser.add_argument("--max-prediction-failures", type=int, default=0,
                         help="failed predictions to hold through before one ends the rollout (default 0: "
                              "the first one ends it)")
+    # How the rows after each takeover are reshaped; chunk_fusion.py describes each mode. The
+    # default stays splice here whatever the joint-policy rollout defaults to: it is real-time
+    # chunking unchanged.
+    parser.add_argument("--chunk-fusion", choices=CHUNK_FUSION_MODES, default="splice")
+    parser.add_argument("--fusion-rows", type=int, default=4,
+                        help="Ticks over which crossfade and rail move onto a new chunk")
     args = parser.parse_args(argv)
     from launch_yaml_eval_molmoact import (
         _build_env,
@@ -318,6 +432,8 @@ def main(argv: Optional[list] = None) -> int:
     )
     if args.camera_fps is not None and args.camera_fps < 1:
         parser.error("--camera-fps must be positive")
+    if args.fusion_rows < 1:
+        parser.error("--fusion-rows must be at least 1")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 
     left_cfg = OmegaConf.to_container(OmegaConf.load(args.config_path), resolve=True)
@@ -390,17 +506,38 @@ def main(argv: Optional[list] = None) -> int:
             camera_roles=roles,
             timed_camera_frame_callback=prepare_camera_frame if camera_frames is not None else None,
         )
+        recording = trace = None
         try:
             rest = np.asarray(env.get_robot_state()["joint_positions"], dtype=np.float32).copy()
             input(f"Instruction: {instruction!r}. Clear the workspace, then press Enter to start "
                   "(Ctrl-C ends the rollout)... ")
             telemetry = RolloutTelemetry(control_hz)
+            import rerun as rr
+
+            trace_path = args.rrd or Path("yam_eval_runs/rerun") / (
+                f"{identity.get('deployment_id') or 'rtc'}_{datetime.now().astimezone():%Y%m%d_%H%M%S}.rrd")
+            trace_path = trace_path.expanduser().resolve()
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
+            # What rollout_compare.py groups runs by when it ranks the settings tried.
+            record_settings(trace_path, dict(
+                deployment=args.orchestral_deployment or identity.get("deployment_id"),
+                policy_adapter=host.policy_adapter, control_hz=control_hz,
+                chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows, s_min=args.s_min,
+                d_init=args.d_init, max_prediction_failures=args.max_prediction_failures,
+                camera_fps=args.camera_fps, execution_mode=mask.execution_mode, active_arm_side=mask.active_arm_side,
+                seconds=args.seconds, noise_seed=args.noise_seed, instruction=instruction))
+            recording = rr.RecordingStream("yam_rtc_rollout")
+            recording.save(trace_path)
+            logger.info("Recording the control trace to %s", trace_path)
+            trace = RolloutTrace(recording, time.monotonic(), host.session, active_arm_side=mask.active_arm_side)
             completed = True
             try:
                 summary = run(env, host, mask, control_hz=control_hz, instruction=instruction,
                               s_min=args.s_min, d_init=args.d_init, seconds=args.seconds, telemetry=telemetry,
                               max_prediction_failures=args.max_prediction_failures, camera_frames=camera_frames,
-                              noise_seed=args.noise_seed)
+                              noise_seed=args.noise_seed,
+                              chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows,
+                              trace=trace)
                 logger.info("Rollout summary: %s", summary)
             except KeyboardInterrupt:
                 logger.info("Interrupted")
@@ -412,7 +549,13 @@ def main(argv: Optional[list] = None) -> int:
                     return_to_captured_rest_pose(
                         env, rest, max_joint_step=float(eval_cfg.get("return_to_rest_max_joint_step", 0.01)))
         finally:
-            env.close()
+            try:
+                env.close()
+            finally:
+                if trace is not None:
+                    trace.stop()
+                if recording is not None:
+                    recording.disconnect()
     finally:
         try:
             host.close()
