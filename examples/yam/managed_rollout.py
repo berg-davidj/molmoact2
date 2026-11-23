@@ -234,13 +234,13 @@ def rollout_joint_policy(host, identity, args):
         raise SystemExit(f"--plan-rows must not exceed the chunk length ({checked_shape[0]})")
     lead_steps = args.prefetch_lead_steps
     if lead_steps is None:
-        # The default lead is about 0.5 s of queued rows: 8 at 15 Hz, 16 at 30 Hz (Rho, AW-0). DW05 runs a 16-row plan with a lead of 4
+        # The default lead is about 0.5 s of queued rows: 8 at 15 Hz, 16 at 30 Hz (Rho). AW-0 measured 63 ms p50 / 70 ms p95 / 254 ms max on the Thor (2 ticks at 30 Hz), so it uses a lead of 6 (200 ms): response-to-command was ~540 ms at 16. DW05 runs a 16-row plan with a lead of 4
         # (about 2 ticks of measured latency plus margin): a chunk spliced at the boundary is then ~4 ticks old, so 12 of its 16 rows are usable.
         # Praxis likewise: a Thor trace shows a plan ready about 70 ms after its observation (p99 126 ms, max 168 ms) but
         # not accepted until the lead's rows have run, 540 ms with a lead of 8; a lead of 4 (267 ms) covers the worst call
         # and brings observation-to-command from about 620 ms to about 340 ms.
         default_lead = {"verne": 1, "flux3-action": 4, "longwam": 16,
-                        "rho": 16, "aw0": 16, "dw05": 4, "praxis1": 4}.get(family, 8)
+                        "rho": 16, "aw0": 6, "dw05": 4, "praxis1": 4}.get(family, 8)
         lead_steps = min(default_lead, plan_rows - 1)
     if lead_steps >= plan_rows:
         raise SystemExit(f"--prefetch-lead-steps must be below the rollout plan length ({plan_rows})")

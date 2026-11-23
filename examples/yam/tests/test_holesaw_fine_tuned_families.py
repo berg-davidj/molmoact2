@@ -269,7 +269,7 @@ def test_policy_family_selection(model, family):
 
 @pytest.mark.parametrize("family, identity, hz, lead, rows", [
     ("rho", dict(state_dim=8, action_dim=8, action_horizon=32), 30, 16, 32),
-    ("aw0", dict(state_dim=14, action_dim=14, action_horizon=32), 30, 16, 32),
+    ("aw0", dict(state_dim=14, action_dim=14, action_horizon=32), 30, 6, 32),
     ("dreamzero", dict(state_dim=7, action_dim=7, action_horizon=24), 15, 8, 24),
     ("fastwam", dict(state_dim=7, action_dim=7, action_horizon=32), 15, 8, 32),
     ("dw05", dict(state_dim=7, action_dim=7, action_horizon=32), 15, 4, 16),
