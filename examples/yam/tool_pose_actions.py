@@ -16,6 +16,8 @@ class ToolPoseActions:
     position_tolerance = 0.002
     rotation_tolerance = 0.02
     accept_norm = 1
+    # Row 0 may start farther from the measured joints than one row's step; None keeps the per-row bound.
+    first_row_max_step_rad = None
 
     def __init__(self, *, model_path, base_body, tool_body, joint_names, max_joint_step_rad):
         import mujoco
@@ -135,7 +137,9 @@ class ToolPoseActions:
                 raise ValueError(f"Degenerate rotation in tool action row {i}")
             second /= norm
             try:
-                joints = self._solve(data, row[:3], np.stack((first, second, np.cross(first, second))), joints)
+                joints = self._solve(data, row[:3], np.stack((first, second, np.cross(first, second))), joints,
+                                     max_step=max(self.max_step, self.first_row_max_step_rad)
+                                     if i == 0 and self.first_row_max_step_rad else None)
             except UnreachableToolPose as error:
                 if i:
                     return output[:i].copy()
@@ -222,6 +226,10 @@ class QuatToolPoseActions(ToolPoseActions):
 class HolesawBimanualActions(ToolPoseActions):
     """The Holesaw training rig puts the physical working arm in the right policy slot."""
 
+    # Row 0 is solved from the MEASURED joints, which lag the model's first command (Holesaw actions are leader
+    # commands), so it needs the same generous cap as QuatToolPoseActions; the executor's per-tick cap
+    # (both_arm_max_delta) limits the actual motion. Later rows keep the per-row step bound.
+    first_row_max_step_rad = 1.0
     working_mount = np.array([0.29985, -0.30516, 0.30165])
     parked_state = np.array([0.06576730, 0.37384747, 0.45302705, -0.13859866,
                              0.73765181, -0.05479971, -0.65852654, 0.009264], dtype=np.float32)
