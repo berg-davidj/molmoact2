@@ -42,7 +42,7 @@ CONTROL_HZ_30_FAMILIES = frozenset({"flux3-action", "longwam", "rho", "aw0"})
 # the checkpoint was trained with. Only the left seven action columns ever reach the robot.
 PARKED_RIGHT_ARM_FAMILIES = frozenset({"isaac05", "aw0"})
 # Rows of each chunk the rollout executes before replanning. Upstream DW05 runs 8 of its 32 rows.
-DEFAULT_PLAN_ROWS = {"verne": 4, "dw05": 8}
+DEFAULT_PLAN_ROWS = {"verne": 4, "dw05": 16}
 PRAXIS_MAX_OBSERVED_ROWS = 19
 NOISE_SEED_FAMILIES = frozenset({"pi05", "flux3-action", "longwam", "praxis1"})
 # The rig's arm swap belongs to this checkpoint, not to every bimanual Praxis model.
@@ -221,9 +221,10 @@ def rollout_joint_policy(host, identity, args):
         raise SystemExit(f"--plan-rows must not exceed the chunk length ({checked_shape[0]})")
     lead_steps = args.prefetch_lead_steps
     if lead_steps is None:
-        # The default lead is about 0.5 s of queued rows: 8 at 15 Hz, 16 at 30 Hz (Rho, AW-0).
+        # The default lead is about 0.5 s of queued rows: 8 at 15 Hz, 16 at 30 Hz (Rho, AW-0). DW05 runs a 16-row plan with a lead of 4
+        # (about 2 ticks of measured latency plus margin): a chunk spliced at the boundary is then ~4 ticks old, so 12 of its 16 rows are usable.
         default_lead = {"verne": 1, "flux3-action": 4, "longwam": 16,
-                        "rho": 16, "aw0": 16}.get(family, 8)
+                        "rho": 16, "aw0": 16, "dw05": 4}.get(family, 8)
         lead_steps = min(default_lead, plan_rows - 1)
     if lead_steps >= plan_rows:
         raise SystemExit(f"--prefetch-lead-steps must be below the rollout plan length ({plan_rows})")

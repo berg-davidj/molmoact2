@@ -653,7 +653,7 @@ them in the red case"). `--plan-rows N` executes only the first N rows of each c
 | `rho` | 30 Hz | `tool_pose_quat` | state 8 and action (H, 8): `[x y z qx qy qz qw gripper]`, absolute | `observation.image.0` top, `.1` left, `.2` right |
 | `dreamzero` | 15 Hz | `identity` | absolute joints (24, 7) | `video.middle`, `video.left` |
 | `fastwam` | 15 Hz | `identity` | absolute joints (32, 7) | `middle`, `left` |
-| `dw05` | 15 Hz, 8 of 32 rows | `identity` | absolute joints (32, 7) | `middle`, `left` |
+| `dw05` | 15 Hz, 16 of 32 rows, lead 4 | `identity` | absolute joints (32, 7) | `middle`, `left` |
 | `aw0` | 30 Hz | `single_arm_in_14` | (H, 14): this arm in 0..6, other arm parked | `cam_high` top, `cam_left_wrist` left |
 
 `tool_pose_quat` uses Rho's end-effector frame: position in meters in the arm base frame,
