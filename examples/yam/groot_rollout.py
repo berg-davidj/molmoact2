@@ -200,7 +200,9 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 if missed:
                     misses += 1
                     print(f"[{model_label.lower()}] Prefetch missed the boundary ({elapsed * 1000:.0f} ms). "
-                          "Replanning.", flush=True)
+                          f"Replanning. (prediction {predictions}, requested with {submitted_with} queued rows, "
+                          f"{request_hold_ticks} hold ticks, {time.monotonic() - started_at:.1f} s into the run)",
+                          flush=True)
                 elif first_row is not None:
                     active_prediction = predictions
                     handoffs += bool(submitted_with)
