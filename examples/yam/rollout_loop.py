@@ -1,4 +1,8 @@
-"""Run the left-arm conveyor GR00T checkpoint through a local Orchestral Worker."""
+"""Shared YAM rollout loop (prediction, IK, prefetch, execution) for every policy family.
+
+Run directly it drives the left-arm conveyor GR00T checkpoint through a local Orchestral Worker;
+``managed_rollout.py`` loads this file for all other families.
+"""
 import argparse
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -272,6 +276,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
     future = None
     active_prediction = 0
     submitted_with = 0
+    submitted_at = 0.0
     request_hold_ticks = 0
     request_prefix_changed = False
     observations = deque()
@@ -351,8 +356,11 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                         raise SystemExit(f"{model_label} returned three consecutive unreachable plans; rollout stopped")
                 if missed:
                     misses += 1
-                    print(f"[{model_label.lower()}] Prefetch missed the boundary ({elapsed * 1000:.0f} ms). "
-                          "Replanning.", flush=True)
+                    # elapsed is predict + IK only; since-request also counts time queued behind observe() calls.
+                    print(f"[{model_label.lower()}] Prefetch missed the boundary ({elapsed * 1000:.0f} ms; "
+                          f"{(time.monotonic() - submitted_at) * 1000:.0f} ms since request, requested with "
+                          f"{submitted_with} queued rows, {request_hold_ticks} hold ticks, prediction {predictions}, "
+                          f"{time.monotonic() - started_at:.1f} s into the run). Replanning.", flush=True)
                 elif first_row is not None:
                     active_prediction = predictions
                     handoffs += bool(submitted_with)
@@ -368,6 +376,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 if temporal_history is not None:
                     cameras, history_inputs = temporal_history.inputs()
                 submitted_with = len(pending)
+                submitted_at = time.monotonic()
                 request_slot = pending.slot
                 request_hold_ticks = 0
                 request_prefix_changed = False
