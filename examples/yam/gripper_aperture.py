@@ -4,7 +4,7 @@ import numpy as np
 
 # These bounds apply to raw model output, before clipping the motor command.
 _PREDICTION_BOUNDS = {
-    "flux3-action": (-0.05, 1.06),
+    "flux3-action": (-0.06, 1.06),
     "longwam": (-0.06, 1.06),
     "molmoact2": (-0.15, 1.15),
 }
