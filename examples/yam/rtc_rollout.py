@@ -53,6 +53,7 @@ from orchestral_session_bridge import OrchestralDirectHost, OrchestralSessionHos
 from rollout_compare import record_settings  # noqa: E402
 from rollout_trace import RolloutTrace  # noqa: E402
 from rtc_camera_frames import RtcCameraFrames, frame_times  # noqa: E402
+import run_recording  # noqa: E402
 
 logger = logging.getLogger("rtc_rollout")
 ARM_DIM = 7
@@ -190,6 +191,8 @@ class RtcChunkFusion:
         fused = np.array(chunk.actions, dtype=np.float32, copy=True)
         fused[rows_run:, :-1] = planned[:, :-1] - offset
         self.fused += continued
+        run_recording.current().decision("fusion", chunk=chunk.seq, mode=self.mode, rows_run=rows_run,
+                                         blend_rows=self.fusion_rows, continued=continued, after_hold=after_hold)
         return chunk._replace(actions=fused)
 
 
@@ -317,6 +320,7 @@ def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_i
                        "spans start at the next tick, so Grafana's capture-time latency panels stay empty. "
                        "Update the orchestral checkout.")
     noise = {} if noise_seed is None else {"noise_seed": noise_seed}
+    recorder = run_recording.current()
     sent = 0
     deadline = session.clock.now() + seconds
     while session.clock.now() < deadline:
@@ -328,7 +332,8 @@ def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_i
                 row_index = chunking.rows.tick - chunk.tick
                 if fusion is not None:
                     fusion.sent()
-        measured = mask.validate_state(env.get_robot_state()["joint_positions"], name="measured_state")
+        with recorder.span("robot_state"):
+            measured = mask.validate_state(env.get_robot_state()["joint_positions"], name="measured_state")
         if row is None:
             telemetry.hold_ticks += 1  # first chunk, late or failed prediction: keep the last target
             if trace is not None:
@@ -338,6 +343,8 @@ def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_i
             target[endpoint] = host.robot_actions(row, query_state)
             command = mask.command_target(target, measured)
             env.step_command_only(command, wait=False)
+            recorder.commanded(chunking.rows.tick, command, chunk=chunk.seq, row=row_index,
+                               clipped=not np.allclose(command, target, atol=1e-6))
             sent += 1
             if trace is not None:
                 trace.tick(measured, target[active_arm], command, chunk.seq, row_index, holding=False)
@@ -348,7 +355,8 @@ def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_i
                 wait_started = session.clock.now()
                 # Reserve half a command tick for dispatching the observation and scheduling the next row.
                 wait_budget = max(0.0, chunking.t_next - wait_started - 0.5 / control_hz)
-                frames = camera_frames.take(wait_budget)
+                with recorder.span("camera_take"):
+                    frames = camera_frames.take(wait_budget)
                 meta["camera_pair_wait_ms"] = 1000 * (session.clock.now() - wait_started)
                 telemetry.camera_pair_fallbacks += frames is None
             prep_started = session.clock.now()
@@ -367,7 +375,8 @@ def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_i
                     )
                 obs = env.get_robot_state()
             state = mask.validate_state(obs["joint_positions"], name="policy input state")[endpoint]
-            inputs, query_state = host.predict_inputs(images, state, cameras_prepared=frames is not None)
+            with recorder.span("predict_inputs"):
+                inputs, query_state = host.predict_inputs(images, state, cameras_prepared=frames is not None)
             queued_at = session.clock.now()
             meta.update(query_state=query_state, observation_prep_ms=1000 * (queued_at - prep_started),
                         queued_at=queued_at)
@@ -412,6 +421,7 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument("--s-min", type=int, default=7, help="rows of a chunk to run before the next request")
     parser.add_argument("--d-init", type=int, default=2, help="prediction delay in ticks until one is measured")
     parser.add_argument("--seconds", type=float, default=60.0, help="rollout length")
+    run_recording.add_arguments(parser)
     parser.add_argument("--rrd", type=Path,
                         help="control trace recording (default: yam_eval_runs/rerun/<deployment>_<timestamp>.rrd)")
     parser.add_argument("--max-prediction-failures", type=int, default=0,
@@ -497,6 +507,8 @@ def main(argv: Optional[list] = None) -> int:
             camera_frames = RtcCameraFrames(roles, 1 / min(camera_fps.values()), skew_limit=skew_limit)
 
         def prepare_camera_frame(role, image, ready_at, captured_at):
+            run_recording.current().frame(role, image, captured_ns=run_recording.ns(captured_at or ready_at),
+                                          ready_ns=run_recording.ns(ready_at))
             # Resize on the capture threads so dispatch only needs to attach current joint feedback.
             camera_frames.publish(role, host.prepare_camera(role, image), ready_at, captured_at)
 
@@ -519,25 +531,29 @@ def main(argv: Optional[list] = None) -> int:
             trace_path = trace_path.expanduser().resolve()
             trace_path.parent.mkdir(parents=True, exist_ok=True)
             # What rollout_compare.py groups runs by when it ranks the settings tried.
-            record_settings(trace_path, dict(
+            settings = dict(
                 deployment=args.orchestral_deployment or identity.get("deployment_id"),
                 policy_adapter=host.policy_adapter, control_hz=control_hz,
                 chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows, s_min=args.s_min,
                 d_init=args.d_init, max_prediction_failures=args.max_prediction_failures,
                 camera_fps=args.camera_fps, execution_mode=mask.execution_mode, active_arm_side=mask.active_arm_side,
-                seconds=args.seconds, noise_seed=args.noise_seed, instruction=instruction))
+                seconds=args.seconds, noise_seed=args.noise_seed, instruction=instruction)
+            record_settings(trace_path, settings)
             recording = rr.RecordingStream("yam_rtc_rollout")
             recording.save(trace_path)
             logger.info("Recording the control trace to %s", trace_path)
             trace = RolloutTrace(recording, time.monotonic(), host.session, active_arm_side=mask.active_arm_side)
             completed = True
             try:
-                summary = run(env, host, mask, control_hz=control_hz, instruction=instruction,
-                              s_min=args.s_min, d_init=args.d_init, seconds=args.seconds, telemetry=telemetry,
-                              max_prediction_failures=args.max_prediction_failures, camera_frames=camera_frames,
-                              noise_seed=args.noise_seed,
-                              chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows,
-                              trace=trace)
+                with run_recording.recording(args, loop="rtc", prompt=instruction, model=host.policy_adapter,
+                                             **settings) as recorder:
+                    recorder.attach(host.session)  # upload="live" starts before the first Prediction
+                    summary = run(env, host, mask, control_hz=control_hz, instruction=instruction,
+                                  s_min=args.s_min, d_init=args.d_init, seconds=args.seconds, telemetry=telemetry,
+                                  max_prediction_failures=args.max_prediction_failures, camera_frames=camera_frames,
+                                  noise_seed=args.noise_seed,
+                                  chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows,
+                                  trace=trace)
                 logger.info("Rollout summary: %s", summary)
             except KeyboardInterrupt:
                 logger.info("Interrupted")

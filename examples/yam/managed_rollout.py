@@ -1,6 +1,6 @@
 import argparse
 import csv
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from datetime import datetime
 import json
 import math
@@ -17,6 +17,7 @@ import numpy as np
 from chunk_fusion import MODES as CHUNK_FUSION_MODES
 from gripper_aperture import clip_predicted_aperture
 from rollout_compare import record_settings
+import run_recording
 from orchestral import Orchestral
 from orchestral.core.tailnet import ManagedTailnetNode, TailscaleCli
 
@@ -288,12 +289,13 @@ def rollout_joint_policy(host, identity, args):
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     # What rollout_compare.py groups runs by when it ranks the settings tried.
-    record_settings(output_path, dict(
+    settings = dict(
         deployment=args.deployment, family=args.policy_family, control_hz=args.control_hz,
         chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows,
         prefetch_lead_steps=lead_steps, committed_actions=committed,
         execution_mode="shadow" if args.shadow else "active_arm_hold",
-        seconds=args.seconds, noise_seed=args.noise_seed, instruction=args.instruction, plan_rows=plan_rows))
+        seconds=args.seconds, noise_seed=args.noise_seed, instruction=args.instruction, plan_rows=plan_rows)
+    record_settings(output_path, settings)
     sensor_roles = {
         "top": "front_camera_rgb",
         "left": "left_camera_rgb",
@@ -318,7 +320,7 @@ def rollout_joint_policy(host, identity, args):
                 rr.TextDocument(f"# Task instruction\n\n{args.instruction}", media_type="text/markdown"),
                 static=True,
             )
-            with TemporaryDirectory(prefix="holesaw-rollout-") as config_dir:
+            with TemporaryDirectory(prefix="holesaw-rollout-") as config_dir, ExitStack() as stack:
                 left_config = Path(config_dir) / "left.yaml"
                 OmegaConf.save(OmegaConf.create(left), left_config)
                 env, *_ = _build_env(
@@ -326,14 +328,19 @@ def rollout_joint_policy(host, identity, args):
                         config_path=left_config, right_config_path=RIGHT_CONFIG,
                         control_hz=args.control_hz, max_steps=None,
                     ),
-                    camera_frame_callback=lambda camera, frame, timestamp: rollout["record_camera_frame"](
-                        recording, camera_paths, frame_counts, count_lock, recording_start,
-                        camera, frame, timestamp,
+                    camera_frame_callback=lambda camera, frame, timestamp: (
+                        run_recording.current().frame(camera, frame, captured_ns=run_recording.ns(timestamp)),
+                        rollout["record_camera_frame"](
+                            recording, camera_paths, frame_counts, count_lock, recording_start,
+                            camera, frame, timestamp,
+                        ),
                     ),
                 )
                 trace = None
                 try:
                     trace = rollout["RolloutTrace"](recording, recording_start, host.session)
+                    stack.enter_context(run_recording.recording(
+                        args, loop="managed", model=family, prompt=args.instruction, **settings)).attach(host.session)
                     rollout["run"](
                         env, host.session, mask, seconds=args.seconds, instruction=args.instruction,
                         shadow=args.shadow, lead_steps=lead_steps,
@@ -676,6 +683,7 @@ def main():
                           help="Ticks over which crossfade and rail move onto a new chunk")
     settings.add_argument("--shadow", action="store_true")
     settings.add_argument("--rrd", type=Path, help="Rerun output path; opt in for soak runs")
+    run_recording.add_arguments(settings)
     settings.add_argument("--metrics", type=Path, help="Soak CSV path (default: yam_eval_runs/soak/gr00t_soak_<timestamp>.metrics.csv)")
     args = settings.parse_args(rollout_args)
     args.deployment = target.deployment
