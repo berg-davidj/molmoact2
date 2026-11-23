@@ -207,7 +207,8 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                     # elapsed is predict + IK only; since-request also counts time queued behind observe() calls.
                     print(f"[{model_label.lower()}] Prefetch missed the boundary ({elapsed * 1000:.0f} ms; "
                           f"{(time.monotonic() - submitted_at) * 1000:.0f} ms since request, requested with "
-                          f"{submitted_with} queued rows, {request_hold_ticks} hold ticks). Replanning.", flush=True)
+                          f"{submitted_with} queued rows, {request_hold_ticks} hold ticks, prediction {predictions}, "
+                          f"{time.monotonic() - started_at:.1f} s into the run). Replanning.", flush=True)
                 elif first_row is not None:
                     active_prediction = predictions
                     handoffs += bool(submitted_with)
