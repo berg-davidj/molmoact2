@@ -205,8 +205,12 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 predictions += 1
             elif stream_observations:
                 # Use the prediction executor to preserve Session order without blocking the control tick.
+                observed_state = (
+                    pose_actions.state(measured[:7].copy(), matrix_policy=matrix_policy)
+                    if pose_actions else measured[:7].copy()
+                )
                 observations.append(predictor.submit(
-                    session.observe, cameras=frames, state=measured[:7].copy(), instruction=instruction,
+                    session.observe, cameras=frames, state=observed_state, instruction=instruction,
                 ))
 
             next_tick += period

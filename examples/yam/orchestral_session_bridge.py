@@ -292,9 +292,14 @@ def _checkpoint_input_names(
     # camera, confirmed by the operator. Only this exact trio is accepted, so
     # ``top_left`` beside any other set of views is still refused as ambiguous.
     terminals = {re.split(r"[./]", name)[-1].lower(): name for name in images}
-    if len(images) == 3 and set(terminals) == {"top_left", "wrist_left", "wrist_right"} and len(states) == 1:
-        return {"top": terminals["top_left"], "left": terminals["wrist_left"],
-                "right": terminals["wrist_right"]}, states[0]
+    # The same names on a single-arm export with one wrist view are accepted too.
+    wrists = {"left": "wrist_left", "right": "wrist_right"}
+    if (len(terminals) == len(images) and len(states) == 1 and "top_left" in terminals
+            and set(terminals) - {"top_left"} and set(terminals) <= {"top_left", *wrists.values()}
+            and (len(images) == 3 or single_arm)):
+        # A single-arm export may carry the overhead view and one wrist only.
+        return {"top": terminals["top_left"],
+                **{role: terminals[name] for role, name in wrists.items() if name in terminals}}, states[0]
     cameras: Dict[str, str] = {}
     for key in CAMERA_KEYS:
         matches = [name for name in images if _camera_role(name, policy_adapter) == key]
