@@ -9,19 +9,27 @@ import rerun as rr
 logger = logging.getLogger(__name__)
 MAX_PENDING_EVENTS = 256
 
-# Where the time goes between a worker response and the robot executing it, per accepted prediction.
-# All are milliseconds. "Commanded" is the first row of the new plan sent to the robot (in a shadow run,
-# the first row taken from the plan).
-LATENCY_STAGES = (
-    "prepare_ms",                 # request preparation; forward kinematics of state and committed rows for pose workers
-    "predict_ms",                 # the worker call (request, inference, response)
-    "ik_ms",                      # inverse kinematics of the new rows (pose workers only)
-    "postprocess_ms",             # response to checked joint chunk: validation, IK, gripper clipping
+# Where the time goes from a request to the robot executing its result, in milliseconds.
+# Per prediction, once its chunk is back, whatever the control loop then does with it:
+PREDICTION_STAGES = (
+    "queue_ms",        # submitted to the predictor thread to the request starting (waits behind observe calls)
+    "prepare_ms",      # request preparation; forward kinematics of state and committed rows for pose workers
+    "predict_ms",      # the worker call (request, inference, response)
+    "ik_ms",           # inverse kinematics of the new rows (pose workers only)
+    "postprocess_ms",  # the rest of response to checked joint chunk: validation and gripper clipping
+)
+# Per accepted prediction, once the first row of its plan is sent (in a shadow run, taken from the plan):
+COMMAND_STAGES = (
     "ready_to_accept_ms",         # chunk waiting for the control loop; includes the prefetch buffer under splice
     "accept_to_command_ms",       # chunk accepted into the plan to its first row sent
     "response_to_command_ms",     # worker response to the first new row sent
     "observation_to_command_ms",  # the control loop reading the observation to the first new row sent
 )
+# Per commanded tick: the control loop's work from the start of the tick to the row being sent.
+TICK_STAGE = "tick_to_command_ms"
+LATENCY_STAGES = (*PREDICTION_STAGES, *COMMAND_STAGES, TICK_STAGE)
+# What the control loop did with a prediction's chunk.
+PREDICTION_OUTCOMES = ("accepted", "unreachable", "missed_boundary", "prefix_changed", "stale")
 
 
 class RolloutTrace:
@@ -94,15 +102,15 @@ class RolloutTrace:
                                rr.AnyValues(prediction_id=prediction_id))
         self._write_event(f"Prediction {prediction_id} received")
 
-    def execution_latency(self, prediction_id, stages):
-        """Log where the time went from a worker response to the robot executing its first row."""
-        self._submit(self._write_execution_latency, prediction_id, dict(stages))
+    def latency(self, stages, event=None):
+        """Log stage durations in milliseconds under /policy/latency, and optionally an event."""
+        self._submit(self._write_latency, dict(stages), event)
 
-    def _write_execution_latency(self, prediction_id, stages):
+    def _write_latency(self, stages, event):
         for name, milliseconds in stages.items():
             self.recording.log(f"/policy/latency/{name}", rr.Scalars(milliseconds))
-        self._write_event(f"Prediction {prediction_id} first row commanded "
-                          f"{stages['response_to_command_ms']:.0f} ms after the response")
+        if event is not None:
+            self._write_event(event)
 
     def event(self, message, *args):
         self._submit(self._write_event, message, *args)
@@ -118,7 +126,7 @@ class RolloutTrace:
         self.recording.log("/robot/measured", rr.Scalars(measured))
         self.recording.log("/policy/holding", rr.Scalars(int(holding)))
         if tick_ms is not None:
-            self.recording.log("/policy/latency/tick_to_command_ms", rr.Scalars(tick_ms))
+            self.recording.log(f"/policy/latency/{TICK_STAGE}", rr.Scalars(tick_ms))
         if row is not None:
             self.recording.log(self._plan_path, rr.Scalars(row),
                                rr.AnyValues(prediction_id=prediction_id, row_index=row_index))

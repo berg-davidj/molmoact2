@@ -389,16 +389,31 @@ https://grafana.orchestrallabs.ai (Clerk SSO). Apart from the span below, this r
 collects no metrics itself.
 
 The joint rollouts in `managed_rollout.py` (every family except Pi0.5) call the Worker
-directly, so the SDK sends no control-loop spans for them. They record one
-`yam.rollout.response_to_command` span per accepted prediction instead. Its duration
-runs from the Worker's response to the first new row sent to the robot. Its
-`yam.rollout.*_ms` attributes split that time and the steps before it: request
-preparation (forward kinematics for tool-pose models), the Worker call, IK, the wait
-for the control loop, and the observation-to-command total. The span carries the
-Session's `orc.*` attributes and goes out through the same relay and the same
-`ORC_TELEMETRY_*` variables as the SDK's own spans. The same stages are in the Rerun
-recording under `/policy/latency`, in the end-of-run summary, and in
-`rollout_trace_report.py`.
+directly, so the SDK sends no control-loop spans for them. They record their own spans
+instead:
+
+- `yam.rollout.ik`: one per prediction that ran IK (tool-pose models), whether or not
+  its chunk was used. The span's duration is the IK solve.
+- `yam.rollout.response_to_command`: one per accepted prediction. The duration runs
+  from the Worker's response to the first new row sent to the robot.
+
+Both carry the prediction's stages as `yam.rollout.*_ms` attributes:
+
+- Before the response: the wait on the predictor thread, request preparation (forward
+  kinematics for tool-pose models), and the Worker call.
+- From the response on: IK, the rest of postprocessing, and the wait for the control
+  loop.
+- `observation_to_command_ms`, the total from the observation to the command.
+
+`yam.rollout.outcome` says what became of the chunk: `accepted`, `unreachable`,
+`missed_boundary`, `prefix_changed` or `stale`. `yam.rollout.shadow` and
+`yam.rollout.chunk_fusion` keep shadow runs and splice runs apart. Under `splice`, the
+wait for the control loop includes the deliberate prefetch buffer. The spans also carry
+the Session's `orc.*` attributes and go out through the same relay and the same
+`ORC_TELEMETRY_*` variables as the SDK's own spans.
+
+The same stages are in the Rerun recording under `/policy/latency`, in the end-of-run
+summary (with the outcome counts), and in `rollout_trace_report.py`.
 
 ## Hardware setup
 

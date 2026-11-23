@@ -28,6 +28,10 @@ class _Session:
 
     def __init__(self, clock):
         self.clock = clock
+        self.observed = 0
+
+    def observe(self, *, cameras, state, instruction):
+        self.observed += 1
 
     def predict(self, *, state, **_kwargs):
         self.clock.now += PREDICT_SECONDS
@@ -36,20 +40,52 @@ class _Session:
         return SimpleNamespace(actions=chunk)
 
 
+class _InlinePredictor:
+    """Runs each submitted call at once, so a run is deterministic; ``running`` is set during the call."""
+
+    running = False
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def submit(self, function, *args, **kwargs):
+        future = Future()
+        _InlinePredictor.running = True
+        try:
+            future.set_result(function(*args, **kwargs))
+        except Exception as error:
+            future.set_exception(error)
+        finally:
+            _InlinePredictor.running = False
+        return future
+
+    def shutdown(self, **kwargs):
+        pass
+
+
 class _PoseActions:
     """Stands in for a tool-pose adapter; the identity map, with the cost of FK and IK."""
 
-    def __init__(self, clock):
+    def __init__(self, clock, *, unreachable_calls=()):
         self.clock = clock
         self.solved = 0
+        self.state_calls = 0
+        self.state_calls_on_control_thread = 0
+        self.unreachable_calls = set(unreachable_calls)
 
     def state(self, joints, *, matrix_policy=False):
         self.clock.now += FK_SECONDS
+        self.state_calls += 1
+        self.state_calls_on_control_thread += not _InlinePredictor.running
         return np.asarray(joints, dtype=np.float32)
 
     def actions(self, rows, start, *, matrix_policy=False):
+        from tool_pose_actions import UnreachableToolPose
+
         self.clock.now += IK_SECONDS
         self.solved += 1
+        if self.solved in self.unreachable_calls:
+            raise UnreachableToolPose("test pose out of reach")
         return np.asarray(rows, dtype=np.float32)
 
 
@@ -77,36 +113,38 @@ class _Mask:
         return target
 
 
-class _InlinePredictor:
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def submit(self, function, *args, **kwargs):
-        future = Future()
-        future.set_result(function(*args, **kwargs))
-        return future
-
-    def shutdown(self, **kwargs):
-        pass
-
-
 class _Trace:
     def __init__(self):
-        self.latency = []
+        self.predictions = []  # PREDICTION_STAGES per chunk, in order
+        self.commands = []  # COMMAND_STAGES per accepted chunk, in order
+        self.events = []
         self.tick_ms = []
 
     def prediction(self, *args, **kwargs):
         pass
 
-    def event(self, *args):
-        pass
+    def event(self, message, *args):
+        self.events.append(message % args if args else message)
 
     def tick(self, *args, holding, tick_ms=None):
         if tick_ms is not None:
             self.tick_ms.append(tick_ms)
 
-    def execution_latency(self, prediction_id, stages):
-        self.latency.append((prediction_id, stages))
+    def latency(self, stages, event=None):
+        (self.commands if "response_to_command_ms" in stages else self.predictions).append(stages)
+        if event is not None:
+            self.events.append(event)
+
+
+class _SpanRecorder:
+    def __init__(self):
+        self.spans = []
+
+    def __call__(self, name, start_ns, end_ns, *, attributes=None):
+        self.spans.append(SimpleNamespace(name=name, duration_ms=(end_ns - start_ns) / 1e6, attributes=attributes))
+
+    def named(self, name):
+        return [span for span in self.spans if span.name == name]
 
 
 @pytest.fixture
@@ -119,102 +157,131 @@ def clock(monkeypatch):
     return clock
 
 
-def test_checked_chunk_times_each_stage_including_ik(clock):
-    from groot_rollout import checked_chunk, execution_latency
+@pytest.fixture
+def spans(monkeypatch):
+    from orchestral.core import tracing
+
+    recorder = _SpanRecorder()
+    monkeypatch.setattr(tracing, "record_span", recorder)
+    return recorder
+
+
+def _run(clock, *, session=None, pose=None, env=None, **kwargs):
+    import groot_rollout
+
+    trace = _Trace()
+    groot_rollout.run(env or _Env(), session or _Session(clock), _Mask(), seconds=3, instruction="go",
+                      camera_bindings={"top": "front_camera_rgb"}, history_offsets=(), lead_steps=4,
+                      pose_actions=pose or _PoseActions(clock), trace=trace, max_plan_rows=8, model_label="rho",
+                      **{"shadow": False, **kwargs})
+    return trace
+
+
+def test_checked_chunk_times_each_stage_and_keeps_ik_out_of_postprocess(clock):
+    from groot_rollout import checked_chunk, command_latency, prediction_latency
 
     timings = {}
+    submitted_at = clock.now
+    clock.now += 0.004  # behind an earlier observe call on the predictor thread
     _, elapsed = checked_chunk(_Session(clock), {}, np.zeros(7, np.float32), "go", episode_start=True,
                                pose_actions=_PoseActions(clock), timings=timings)
     clock.now += 0.010  # waiting for the control loop
     accepted_at = clock.now
     clock.now += 0.001
-    stages = execution_latency(timings, observed_at=0.0, accepted_at=accepted_at, commanded_at=clock.now)
+    stages = {**prediction_latency(timings, submitted_at),
+              **command_latency(timings, observed_at=0.0, accepted_at=accepted_at, commanded_at=clock.now)}
     assert elapsed == pytest.approx(FK_SECONDS + PREDICT_SECONDS + IK_SECONDS)
+    assert stages["queue_ms"] == pytest.approx(4)
     assert stages["prepare_ms"] == pytest.approx(1000 * FK_SECONDS)
     assert stages["predict_ms"] == pytest.approx(1000 * PREDICT_SECONDS)
     assert stages["ik_ms"] == pytest.approx(1000 * IK_SECONDS)
-    assert stages["postprocess_ms"] == pytest.approx(1000 * IK_SECONDS)
+    assert stages["postprocess_ms"] == pytest.approx(0)
     assert stages["ready_to_accept_ms"] == pytest.approx(10)
     assert stages["accept_to_command_ms"] == pytest.approx(1)
     assert stages["response_to_command_ms"] == pytest.approx(1000 * IK_SECONDS + 11)
-    assert stages["observation_to_command_ms"] == pytest.approx(1000 * (FK_SECONDS + PREDICT_SECONDS + IK_SECONDS) + 11)
+    assert stages["observation_to_command_ms"] == pytest.approx(
+        1000 * (FK_SECONDS + PREDICT_SECONDS + IK_SECONDS) + 15)
 
 
 def test_joint_worker_has_no_ik_stage(clock):
-    from groot_rollout import checked_chunk
+    from groot_rollout import checked_chunk, prediction_latency
 
     timings = {}
     checked_chunk(_Session(clock), {}, np.zeros(7, np.float32), "go", episode_start=True, timings=timings)
     assert "ik_seconds" not in timings
-    assert timings["ready"] - timings["responded"] == 0
+    assert "ik_ms" not in prediction_latency(timings, submitted_at=0.0)
 
 
 @pytest.mark.parametrize("mode", ["splice", "crossfade"])
-def test_rollout_traces_response_to_command_latency_per_accepted_prediction(clock, mode, capsys):
-    import groot_rollout
-
-    pose, trace, env = _PoseActions(clock), _Trace(), _Env()
-    groot_rollout.run(env, _Session(clock), _Mask(), seconds=3, instruction="go", shadow=False,
-                      camera_bindings={"top": "front_camera_rgb"}, history_offsets=(), lead_steps=4,
-                      pose_actions=pose, trace=trace, chunk_fusion=mode, max_plan_rows=8)
-    assert len(trace.latency) >= 3
-    assert [prediction_id for prediction_id, _ in trace.latency] == list(range(1, len(trace.latency) + 1))
-    for _, stages in trace.latency:
+def test_rollout_traces_every_prediction_and_each_first_command(clock, mode, capsys):
+    env = _Env()
+    trace = _run(clock, env=env, chunk_fusion=mode)
+    assert len(trace.commands) >= 3
+    assert len(trace.predictions) >= len(trace.commands)
+    for stages in trace.predictions:
         assert stages["predict_ms"] == pytest.approx(1000 * PREDICT_SECONDS)
         assert stages["ik_ms"] == pytest.approx(1000 * IK_SECONDS)
-        assert stages["response_to_command_ms"] == pytest.approx(
-            stages["postprocess_ms"] + stages["ready_to_accept_ms"] + stages["accept_to_command_ms"])
-        assert stages["observation_to_command_ms"] >= (
-            stages["prepare_ms"] + stages["predict_ms"] + stages["response_to_command_ms"])
+    for prediction, command in zip(trace.predictions, trace.commands):
+        assert command["response_to_command_ms"] == pytest.approx(
+            prediction["ik_ms"] + prediction["postprocess_ms"] + command["ready_to_accept_ms"]
+            + command["accept_to_command_ms"])
+        assert command["observation_to_command_ms"] >= (
+            prediction["queue_ms"] + prediction["prepare_ms"] + prediction["predict_ms"]
+            + command["response_to_command_ms"])
     assert len(trace.tick_ms) == env.commands
     summary = capsys.readouterr().out
-    assert f"Latency in ms over {len(trace.latency)} accepted predictions" in summary
-    for stage in ("ik_ms", "response_to_command_ms", "tick_to_command_ms"):
-        assert stage in summary
+    assert f"over {len(trace.predictions)} predictions, {len(trace.commands)} commanded" in summary
+    for line in ("queue_ms", "ik_ms", "response_to_command_ms", "tick_to_command_ms",
+                 f"outcomes: accepted {len(trace.commands)}"):
+        assert line in summary
 
 
-class _SpanRecorder:
-    def __init__(self):
-        self.spans = []
+def test_ik_of_a_dropped_chunk_is_still_measured_and_sent(clock, spans, capsys):
+    trace = _run(clock, pose=_PoseActions(clock, unreachable_calls={2}))
+    assert "Prediction 2 rejected: unreachable plan" in trace.events
+    assert len(trace.predictions) == len(trace.commands) + 1
+    assert trace.predictions[1]["ik_ms"] == pytest.approx(1000 * IK_SECONDS)
+    dropped = [span for span in spans.named("yam.rollout.ik") if span.attributes["yam.rollout.prediction_id"] == 2]
+    assert len(dropped) == 1
+    assert dropped[0].attributes["yam.rollout.outcome"] == "unreachable"
+    assert dropped[0].duration_ms == pytest.approx(1000 * IK_SECONDS, abs=1e-3)
+    assert 2 not in [span.attributes["yam.rollout.prediction_id"]
+                     for span in spans.named("yam.rollout.response_to_command")]
+    assert "unreachable 1" in capsys.readouterr().out
 
-    def __call__(self, name, start_ns, end_ns, *, attributes=None):
-        self.spans.append((name, start_ns, end_ns, attributes))
+
+def test_streamed_observation_kinematics_stay_off_the_control_tick(clock):
+    pose, session = _PoseActions(clock), _Session(clock)
+    trace = _run(clock, pose=pose, session=session, stream_observations=True)
+    assert session.observed > len(trace.predictions)
+    assert pose.state_calls >= session.observed + len(trace.predictions)
+    assert pose.state_calls_on_control_thread == 0
 
 
-def _traced_session(clock):
+@pytest.mark.parametrize("shadow", [False, True])
+def test_each_prediction_is_a_grafana_span(clock, spans, shadow):
     session = _Session(clock)
     session._trace_attributes = lambda: {"orc.deployment_id": "dep-1", "orc.session_id": "s-1"}
-    return session
-
-
-def _run(groot_rollout, clock, session, **kwargs):
-    trace = _Trace()
-    groot_rollout.run(_Env(), session, _Mask(), seconds=3, instruction="go", shadow=False,
-                      camera_bindings={"top": "front_camera_rgb"}, history_offsets=(), lead_steps=4,
-                      pose_actions=_PoseActions(clock), trace=trace, max_plan_rows=8, model_label="rho", **kwargs)
-    return trace
-
-
-def test_each_accepted_prediction_is_a_grafana_span(clock, monkeypatch):
-    import groot_rollout
-    from orchestral.core import tracing
-
-    recorder = _SpanRecorder()
-    monkeypatch.setattr(tracing, "record_span", recorder)
-    trace = _run(groot_rollout, clock, _traced_session(clock))
-    assert len(recorder.spans) == len(trace.latency) >= 3
-    for (name, start_ns, end_ns, attributes), (prediction_id, stages) in zip(recorder.spans, trace.latency):
-        assert name == "yam.rollout.response_to_command"
-        assert (end_ns - start_ns) / 1e6 == pytest.approx(stages["response_to_command_ms"], abs=1e-3)
-        assert attributes["orc.deployment_id"] == "dep-1"
-        assert attributes["yam.rollout.family"] == "rho"
-        assert attributes["yam.rollout.prediction_id"] == prediction_id
-        assert attributes["yam.rollout.ik_ms"] == pytest.approx(1000 * IK_SECONDS)
-        assert attributes["yam.rollout.predict_ms"] == pytest.approx(1000 * PREDICT_SECONDS)
+    trace = _run(clock, session=session, shadow=shadow)
+    ik, commanded = spans.named("yam.rollout.ik"), spans.named("yam.rollout.response_to_command")
+    assert len(ik) == len(trace.predictions) and len(commanded) == len(trace.commands) >= 3
+    for span in ik:
+        assert span.duration_ms == pytest.approx(1000 * IK_SECONDS, abs=1e-3)
+        assert span.attributes["yam.rollout.outcome"] == "accepted"
+    for span, command in zip(commanded, trace.commands):
+        assert span.duration_ms == pytest.approx(command["response_to_command_ms"], abs=1e-3)
+        assert span.attributes["yam.rollout.ik_ms"] == pytest.approx(1000 * IK_SECONDS)
+        assert span.attributes["yam.rollout.predict_ms"] == pytest.approx(1000 * PREDICT_SECONDS)
+    for span in ik + commanded:
+        assert span.attributes["orc.deployment_id"] == "dep-1"
+        assert span.attributes["yam.rollout.family"] == "rho"
+        assert span.attributes["yam.rollout.shadow"] is shadow
+        assert span.attributes["yam.rollout.chunk_fusion"] == "splice"
+    assert [span.attributes["yam.rollout.prediction_id"] for span in commanded] == list(
+        range(1, len(commanded) + 1))
 
 
 def test_a_failing_span_never_stops_the_rollout(clock, monkeypatch, capsys):
-    import groot_rollout
     from orchestral.core import tracing
 
     calls = []
@@ -224,17 +291,16 @@ def test_a_failing_span_never_stops_the_rollout(clock, monkeypatch, capsys):
         raise RuntimeError("exporter down")
 
     monkeypatch.setattr(tracing, "record_span", broken)
-    trace = _run(groot_rollout, clock, _Session(clock))
-    assert len(trace.latency) >= 3
+    trace = _run(clock)
+    assert len(trace.commands) >= 3
     assert len(calls) == 1
     assert "Stopped recording latency spans: exporter down" in capsys.readouterr().out
 
 
 def test_an_sdk_without_span_recording_keeps_the_rerun_trace(clock, monkeypatch, capsys):
-    import groot_rollout
     from orchestral.core import tracing
 
     monkeypatch.delattr(tracing, "record_span")
-    trace = _run(groot_rollout, clock, _Session(clock))
-    assert len(trace.latency) >= 3
+    trace = _run(clock)
+    assert len(trace.commands) >= 3
     assert "cannot record spans" in capsys.readouterr().out

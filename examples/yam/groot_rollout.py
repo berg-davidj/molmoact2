@@ -1,7 +1,8 @@
 """Run the left-arm conveyor GR00T checkpoint through a local Orchestral Worker."""
 import argparse
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime
 import math
 from pathlib import Path
@@ -18,7 +19,7 @@ import rerun.blueprint as rrb
 
 from chunk_fusion import MODES as CHUNK_FUSION_MODES, ChunkPlan
 from gripper_aperture import clip_predicted_aperture
-from rollout_trace import LATENCY_STAGES, RolloutTrace
+from rollout_trace import COMMAND_STAGES, PREDICTION_OUTCOMES, PREDICTION_STAGES, TICK_STAGE, RolloutTrace
 
 CAMERAS = {"belt": "front_camera_rgb", "wrist": "left_camera_rgb"}
 CONTROL_HZ = 15  # training rate of the YAM checkpoints; one action per 15 Hz step
@@ -43,7 +44,7 @@ def checked_chunk(session, cameras, state, instruction, *, episode_start, action
     """Query the worker and return the checked joint chunk and the seconds it took.
 
     ``timings``, when given, is filled with monotonic timestamps of each stage (see
-    ``execution_latency``) so the control loop can measure response-to-command latency.
+    ``prediction_latency`` and ``command_latency``) so the control loop can measure each stage.
     """
     start = time.monotonic()
     query_state = pose_actions.state(state, matrix_policy=matrix_policy) if pose_actions else state
@@ -111,80 +112,123 @@ def checked_chunk(session, cameras, state, instruction, *, episode_start, action
     return chunk, ready - start
 
 
-def execution_latency(timings, observed_at, accepted_at, commanded_at):
-    """Stage durations in milliseconds from ``checked_chunk`` timestamps and the control loop's own."""
-    def ms(seconds):
-        return 1000.0 * seconds
+def _ms(seconds):
+    return 1000.0 * seconds
 
+
+def prediction_latency(timings, submitted_at):
+    """``PREDICTION_STAGES`` from ``checked_chunk`` timestamps and the time the request was submitted."""
+    ik_seconds = timings.get("ik_seconds")
     stages = {
-        "prepare_ms": ms(timings["requested"] - timings["started"]),
-        "predict_ms": ms(timings["responded"] - timings["requested"]),
-        "postprocess_ms": ms(timings["ready"] - timings["responded"]),
-        "ready_to_accept_ms": ms(accepted_at - timings["ready"]),
-        "accept_to_command_ms": ms(commanded_at - accepted_at),
-        "response_to_command_ms": ms(commanded_at - timings["responded"]),
-        "observation_to_command_ms": ms(commanded_at - observed_at),
+        "queue_ms": _ms(timings["started"] - submitted_at),
+        "prepare_ms": _ms(timings["requested"] - timings["started"]),
+        "predict_ms": _ms(timings["responded"] - timings["requested"]),
+        "postprocess_ms": _ms(timings["ready"] - timings["responded"] - (ik_seconds or 0.0)),
     }
-    if "ik_seconds" in timings:
-        stages["ik_ms"] = ms(timings["ik_seconds"])
+    if ik_seconds is not None:
+        stages["ik_ms"] = _ms(ik_seconds)
     return stages
 
 
-class LatencySpans:
-    """Send each accepted prediction's response-to-command latency to Grafana as a span.
+def command_latency(timings, observed_at, accepted_at, commanded_at):
+    """``COMMAND_STAGES`` once the first row of an accepted prediction's plan is sent."""
+    return {
+        "ready_to_accept_ms": _ms(accepted_at - timings["ready"]),
+        "accept_to_command_ms": _ms(commanded_at - accepted_at),
+        "response_to_command_ms": _ms(commanded_at - timings["responded"]),
+        "observation_to_command_ms": _ms(commanded_at - observed_at),
+    }
 
-    One `yam.rollout.response_to_command` span per prediction: its duration is the worker response
-    to the first new row sent, and every stage in ``LATENCY_STAGES`` is a `yam.rollout.<stage>`
-    attribute, next to the Session's own `orc.*` attributes. The Orchestral SDK relays it with its
-    own spans, so it is sent only when the SDK has telemetry credentials (`ORC_TELEMETRY_BASE_URL`
-    and `ORC_TELEMETRY_API_KEY` for a grant-only Session). Recording never stops the control loop.
+
+@dataclass
+class AcceptedPrediction:
+    """A prediction whose plan the control loop took, until its first row is sent."""
+
+    prediction_id: int
+    timings: dict
+    stages: dict
+    observed_at: float
+    accepted_at: float
+
+
+class LatencySpans:
+    """Send rollout latency to Grafana as spans, next to the Orchestral SDK's own.
+
+    - `yam.rollout.ik`: every prediction that ran IK (pose workers), whatever became of its chunk;
+      the duration is the IK solve.
+    - `yam.rollout.response_to_command`: every accepted prediction; the duration is the worker
+      response to the first new row sent.
+
+    Each span carries its prediction's stages as `yam.rollout.<stage>` attributes, its
+    `yam.rollout.outcome` (one of ``PREDICTION_OUTCOMES``), the family, `yam.rollout.shadow` and
+    `yam.rollout.chunk_fusion`, and the Session's own `orc.*` attributes. The SDK relays them with its
+    own spans, so they are sent only when it has telemetry credentials (`ORC_TELEMETRY_BASE_URL` and
+    `ORC_TELEMETRY_API_KEY` for a grant-only Session). Recording never stops the control loop.
     """
 
-    name = "yam.rollout.response_to_command"
+    ik_name = "yam.rollout.ik"
+    command_name = "yam.rollout.response_to_command"
 
-    def __init__(self, session, family):
+    def __init__(self, session, family, *, shadow, chunk_fusion):
         try:
             from orchestral.core import tracing
         except ImportError:
             tracing = None
         self._tracing = tracing if callable(getattr(tracing, "record_span", None)) else None
         if self._tracing is None:
-            print("[telemetry] This Orchestral SDK cannot record spans; response-to-command latency "
+            print("[telemetry] This Orchestral SDK cannot record spans; rollout latency "
                   "stays in the Rerun trace only.", flush=True)
         attributes = getattr(session, "_trace_attributes", None)
         self._attributes = attributes if callable(attributes) else dict
-        self._family = family
+        self._labels = {"yam.rollout.family": family, "yam.rollout.shadow": bool(shadow),
+                        "yam.rollout.chunk_fusion": chunk_fusion}
         self._failed = False
 
-    def record(self, prediction_id, stages):
+    def prediction(self, prediction_id, outcome, stages):
+        if "ik_ms" in stages:
+            self._record(self.ik_name, stages["ik_ms"], prediction_id, outcome, stages)
+
+    def command(self, prediction_id, stages):
+        self._record(self.command_name, stages["response_to_command_ms"], prediction_id, "accepted", stages)
+
+    def _record(self, name, duration_ms, prediction_id, outcome, stages):
         if self._tracing is None or self._failed:
             return
         try:
             end_ns = time.time_ns()
-            start_ns = end_ns - round(stages["response_to_command_ms"] * 1e6)
-            attributes = {**self._attributes(), "yam.rollout.family": self._family,
-                          "yam.rollout.prediction_id": prediction_id,
-                          **{f"yam.rollout.{name}": round(value, 3) for name, value in stages.items()}}
-            self._tracing.record_span(self.name, start_ns, end_ns, attributes=attributes)
+            attributes = {**self._attributes(), **self._labels, "yam.rollout.prediction_id": prediction_id,
+                          "yam.rollout.outcome": outcome,
+                          **{f"yam.rollout.{stage}": round(value, 3) for stage, value in stages.items()}}
+            self._tracing.record_span(name, end_ns - round(duration_ms * 1e6), end_ns, attributes=attributes)
         except Exception as error:  # telemetry must not interrupt the robot
             self._failed = True
             print(f"[telemetry] Stopped recording latency spans: {error}", flush=True)
 
 
-def latency_summary(samples, tick_ms):
-    """Lines of p50 / p95 / max per stage, for the end-of-run printout."""
+def latency_summary(prediction_samples, command_samples, tick_ms, outcomes):
+    """Lines of p50 / p95 / max per stage and the prediction outcomes, for the end-of-run printout."""
     def row(name, values):
         return (f"  {name:<27} {np.percentile(values, 50):8.1f} {np.percentile(values, 95):8.1f} "
                 f"{np.max(values):8.1f}")
 
-    lines = [f"Latency in ms over {len(samples)} accepted predictions:      p50      p95      max"]
-    for stage in LATENCY_STAGES:
-        values = [sample[stage] for sample in samples if stage in sample]
-        if values:
-            lines.append(row(stage, values))
+    lines = [f"Latency in ms over {len(prediction_samples)} predictions, "
+             f"{len(command_samples)} commanded:      p50      p95      max"]
+    for samples, stages in ((prediction_samples, PREDICTION_STAGES), (command_samples, COMMAND_STAGES)):
+        for stage in stages:
+            values = [sample[stage] for sample in samples if stage in sample]
+            if values:
+                lines.append(row(stage, values))
     if tick_ms:
-        lines.append(row("tick_to_command_ms", tick_ms))
+        lines.append(row(TICK_STAGE, tick_ms))
+    lines.append("  outcomes: " + ", ".join(f"{name} {outcomes[name]}" for name in PREDICTION_OUTCOMES
+                                            if outcomes[name]))
     return lines
+
+
+def observe(session, frames, joints, instruction, *, pose_actions=None, matrix_policy=False):
+    """Stream one observation; a pose worker's forward kinematics runs here, off the control tick."""
+    state = pose_actions.state(joints, matrix_policy=matrix_policy) if pose_actions else joints
+    session.observe(cameras=frames, state=state, instruction=instruction)
 
 
 def warm_session(session, instruction):
@@ -232,11 +276,11 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
     request_prefix_changed = False
     observations = deque()
     request_timings = {}
-    request_observed_at = None
-    awaiting_command = None  # (prediction id, checked_chunk timings, observed at, accepted at)
-    latency_samples = []
-    latency_spans = LatencySpans(session, model_label)
-    tick_latencies_ms = []
+    request_observed_at = request_submitted_at = None
+    awaiting_command = None  # an AcceptedPrediction until its first row is sent
+    prediction_samples, command_samples, tick_latencies_ms = [], [], []
+    outcomes = Counter()
+    latency_spans = LatencySpans(session, model_label, shadow=shadow, chunk_fusion=chunk_fusion)
     rejected_chunks = 0
     rows = predictions = handoffs = misses = holds = 0
     call_ms, stage_rows = [], []
@@ -279,14 +323,23 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 # observation instead of applying a plan computed before the hold.
                 missed = bool(submitted_with and request_hold_ticks)
                 first_row = None if missed or request_prefix_changed else pending.add(chunk, request_slot)
+                outcome = ("unreachable" if not len(chunk) else "missed_boundary" if missed
+                           else "prefix_changed" if request_prefix_changed
+                           else "stale" if first_row is None else "accepted")
+                # Recorded for every chunk: IK is most likely to matter in the ones that came too late.
+                prediction_stages = prediction_latency(request_timings, request_submitted_at)
+                prediction_samples.append(prediction_stages)
+                outcomes[outcome] += 1
+                latency_spans.prediction(predictions, outcome, prediction_stages)
                 if trace is not None:
-                    if not len(chunk):
+                    trace.latency(prediction_stages)
+                    if outcome == "unreachable":
                         trace.event("Prediction %d rejected: unreachable plan", predictions)
-                    elif missed:
+                    elif outcome == "missed_boundary":
                         trace.event("Prediction %d dropped after %d hold ticks", predictions, request_hold_ticks)
-                    elif request_prefix_changed:
+                    elif outcome == "prefix_changed":
                         trace.event("Prediction %d dropped after the safety mask changed a committed target", predictions)
-                    elif first_row is None:
+                    elif outcome == "stale":
                         trace.event("Prediction %d dropped: every row was stale", predictions)
                     else:
                         trace.event("Prediction %d accepted starting at row %d", predictions, first_row)
@@ -303,7 +356,8 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 elif first_row is not None:
                     active_prediction = predictions
                     handoffs += bool(submitted_with)
-                    awaiting_command = (predictions, request_timings, request_observed_at, time.monotonic())
+                    awaiting_command = AcceptedPrediction(predictions, request_timings, prediction_stages,
+                                                          request_observed_at, time.monotonic())
             if len(history) == history_size and future is None and len(pending) <= lead_steps:
                 cameras = (
                     {name: np.stack([history[offset - 1][name] for offset in history_offsets])
@@ -322,6 +376,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 request_observed_at = observed_at
                 if trace is not None:
                     trace.event("Prediction %d requested with %d queued rows", predictions + 1, submitted_with)
+                request_submitted_at = time.monotonic()
                 future = predictor.submit(checked_chunk, session, cameras, measured[:7].copy(),
                                           instruction, episode_start=(predictions == 0),
                                           action_shape=action_shape, model_label=model_label,
@@ -334,12 +389,11 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 predictions += 1
             elif stream_observations:
                 # Use the prediction executor to preserve Session order without blocking the control tick.
-                observed_state = (
-                    pose_actions.state(measured[:7].copy(), matrix_policy=matrix_policy)
-                    if pose_actions else measured[:7].copy()
-                )
+                # It also runs a pose worker's forward kinematics, so the command below does not wait for it;
+                # the single worker thread never uses pose_actions from two threads at once.
                 observations.append(predictor.submit(
-                    session.observe, cameras=frames, state=observed_state, instruction=instruction,
+                    observe, session, frames, measured[:7].copy(), instruction,
+                    pose_actions=pose_actions, matrix_policy=matrix_policy,
                 ))
 
             next_tick += period
@@ -364,13 +418,14 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 tick_ms = 1000.0 * (commanded_at - tick_started)
                 tick_latencies_ms.append(tick_ms)
                 if awaiting_command is not None:
-                    prediction_id, timings, request_observed, accepted_at = awaiting_command
-                    awaiting_command = None
-                    stages = execution_latency(timings, request_observed, accepted_at, commanded_at)
-                    latency_samples.append(stages)
-                    latency_spans.record(prediction_id, stages)
+                    accepted, awaiting_command = awaiting_command, None
+                    stages = command_latency(accepted.timings, accepted.observed_at, accepted.accepted_at,
+                                             commanded_at)
+                    command_samples.append(stages)
+                    latency_spans.command(accepted.prediction_id, {**accepted.stages, **stages})
                     if trace is not None:
-                        trace.execution_latency(prediction_id, stages)
+                        trace.latency(stages, event=f"Prediction {accepted.prediction_id} first row commanded "
+                                                    f"{stages['response_to_command_ms']:.0f} ms after the response")
             elif future is not None:
                 request_hold_ticks += 1
                 holds += 1
@@ -383,8 +438,9 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
         # Printed on Ctrl+C too: that is how an operator ends most rollouts.
         if call_ms:
             print(latency_line(model_label, call_ms, stage_rows, final=True), flush=True)
-        if latency_samples:
-            print("\n".join(latency_summary(latency_samples, tick_latencies_ms)), flush=True)
+        if prediction_samples:
+            print("\n".join(latency_summary(prediction_samples, command_samples, tick_latencies_ms, outcomes)),
+                  flush=True)
     print(f"{model_label} rollout finished. {predictions} predictions, {rows} {'shadow rows' if shadow else 'commands'}, "
           f"{handoffs} prefetched handoffs, {misses} missed boundaries, {holds} hold ticks.")
 

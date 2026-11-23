@@ -89,7 +89,7 @@ def report(path):
         lines.append(f"  prediction latency p50 {np.median(latency):.0f} ms, max {latency.max():.0f} ms "
                      f"({latency.max() / tick_ms:.1f} ticks)")
     # Response-to-execution stages (recordings made before these were traced have none).
-    for name in (*LATENCY_STAGES, "tick_to_command_ms"):
+    for name in LATENCY_STAGES:
         values = np.array([_unwrap(row["Scalars:scalars"]) for row in trace.get(f"/policy/latency/{name}", [])])
         if len(values):
             lines.append(f"  {name:<27} p50 {np.median(values):6.1f} ms, p95 {np.percentile(values, 95):6.1f} ms, "
