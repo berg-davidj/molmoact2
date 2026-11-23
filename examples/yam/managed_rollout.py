@@ -32,6 +32,10 @@ ISAAC_BIMANUAL_CONTROL_HZ = 30  # the release checkpoint's rate; one action per 
 ISAAC_BIMANUAL_PLAN_ROWS = 30   # replan every second instead of running the full 2 s chunk
 COMMITTED_ACTION_FAMILIES = frozenset({"gr00t", "isaac05", "flux3-action", "molmoact2", "longwam", "praxis1"})
 NOISE_SEED_FAMILIES = frozenset({"pi05", "flux3-action", "longwam", "praxis1"})
+# The rig's arm swap belongs to this checkpoint, not to every bimanual Praxis model.
+PRAXIS_HOLESAW_BIMANUAL_CHECKPOINT = (
+    "file:///cache/private-checkpoints/praxis1-yam-holesaw-15hz-full-step001155"
+)
 
 original_init = ManagedTailnetNode.__init__
 original_run = TailscaleCli.run
@@ -530,7 +534,7 @@ def main():
                         help="Run a robot-free live-camera endpoint soak for this many hours")
     parser.add_argument("--noise-seed", type=parse_noise_seed, help="Fixed noise seed for each prediction")
     parser.add_argument("--praxis-holesaw-bimanual", action="store_true",
-                        help="Use the 3-camera Holesaw grasp-site rig with the working arm in the right policy slot")
+                        help="Select the Holesaw grasp-site rig for a checkpoint without a known layout")
     target, rollout_args = parser.parse_known_args()
     if not math.isfinite(target.soak_hours) or target.soak_hours < 0:
         parser.error("--soak-hours must be finite and nonnegative")
@@ -610,7 +614,9 @@ def main():
     adapter = {
         "gr00t": GR00T_YAM_ADAPTER,
         "flux3-action": TEMPORAL_JOINT_ADAPTER,
-        "praxis1": PRAXIS_HOLESAW_BIMANUAL if target.praxis_holesaw_bimanual else TOOL_POSE_MATRIX_ADAPTER,
+        "praxis1": PRAXIS_HOLESAW_BIMANUAL if (
+            target.praxis_holesaw_bimanual or deployment.checkpoint_uri == PRAXIS_HOLESAW_BIMANUAL_CHECKPOINT
+        ) else TOOL_POSE_MATRIX_ADAPTER,
         "verne": TOOL_POSE_ADAPTER,
         "pi05": "pi05_yam_red_cap" if target.soak_hours <= 0 else "identity",
     }.get(family, "identity")
