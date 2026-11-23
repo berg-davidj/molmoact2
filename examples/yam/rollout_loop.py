@@ -1,7 +1,12 @@
-"""Run the left-arm conveyor GR00T checkpoint through a local Orchestral Worker."""
+"""Shared YAM rollout loop (prediction, IK, prefetch, execution) for every policy family.
+
+Run directly it drives the left-arm conveyor GR00T checkpoint through a local Orchestral Worker;
+``managed_rollout.py`` loads this file for all other families.
+"""
 import argparse
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime
 import math
 from pathlib import Path
@@ -18,7 +23,7 @@ import rerun.blueprint as rrb
 
 from chunk_fusion import MODES as CHUNK_FUSION_MODES, ChunkPlan
 from gripper_aperture import clip_predicted_aperture
-from rollout_trace import RolloutTrace
+from rollout_trace import COMMAND_STAGES, PREDICTION_OUTCOMES, PREDICTION_STAGES, TICK_STAGE, RolloutTrace
 import run_recording
 
 CAMERAS = {"belt": "front_camera_rgb", "wrist": "left_camera_rgb"}
@@ -40,7 +45,12 @@ def frames_for_policy(obs, camera_shapes, camera_bindings=CAMERAS):
 def checked_chunk(session, cameras, state, instruction, *, episode_start, action_shape=ACTION_SHAPE,
                   model_label="GR00T", gripper_tolerance=None, pose_actions=None, matrix_policy=False,
                   observation_time=None, max_plan_rows=None, history_inputs=None, trace=None, prediction_id=0,
-                  state_padding=None, committed_actions=None, noise_seed=None, observation=None):
+                  state_padding=None, committed_actions=None, noise_seed=None, timings=None, observation=None):
+    """Query the worker and return the checked joint chunk and the seconds it took.
+
+    ``timings``, when given, is filled with monotonic timestamps of each stage (see
+    ``prediction_latency`` and ``command_latency``) so the control loop can measure each stage.
+    """
     start = time.monotonic()
     query_state = pose_actions.state(state, matrix_policy=matrix_policy) if pose_actions else state
     if state_padding is not None:
@@ -64,14 +74,16 @@ def checked_chunk(session, cameras, state, instruction, *, episode_start, action
         sensors["committed_actions"] = committed_actions
     if noise_seed is not None:
         sensors["noise_seed"] = noise_seed
+    requested = time.monotonic()
     response = session.predict(cameras=cameras, state=query_state, instruction=instruction,
                                episode_start=episode_start, **sensors, **run_recording.predict_link(observation))
+    responded = time.monotonic()
     chunk = np.asarray(response.actions, dtype=np.float32)
     # The chunk id is the rollout's prediction number; link it to the SDK's Prediction record.
     run_recording.current().chunk(prediction_id, outcome="returned", rows=len(chunk),
                                   prediction=getattr(session, "last_recorded_prediction", None))
     if trace is not None:
-        trace.prediction(prediction_id, response, chunk, session, time.monotonic() - start)
+        trace.prediction(prediction_id, response, chunk, session, responded - start)
     if chunk.shape != action_shape or not np.isfinite(chunk).all():
         raise ValueError(f"{model_label} returned an invalid action chunk")
     if committed_actions is not None and not np.array_equal(chunk[:len(committed_actions)], committed_actions):
@@ -79,6 +91,7 @@ def checked_chunk(session, cameras, state, instruction, *, episode_start, action
     chunk = chunk[:max_plan_rows]
     if state_padding is not None:
         chunk = chunk[:, :len(state)]
+    ik_seconds = 0.0
     if pose_actions:
         from tool_pose_actions import UnreachableToolPose
 
@@ -89,14 +102,141 @@ def checked_chunk(session, cameras, state, instruction, *, episode_start, action
         suffix = chunk[len(kept):]
         chunk = kept
         if len(suffix):
+            ik_started = time.monotonic()
             try:
                 solved = pose_actions.actions(suffix, kept[-1] if len(kept) else state, matrix_policy=matrix_policy)
                 chunk = np.concatenate((kept, solved))
             except UnreachableToolPose as error:
                 print(f"[{model_label.lower()}] {error}. Replanning after the queued targets.", flush=True)
+            finally:
+                ik_seconds = time.monotonic() - ik_started
     chunk = chunk.copy()
     chunk[:, 6] = clip_predicted_aperture(chunk[:, 6], model_label, tolerance=gripper_tolerance)
-    return chunk, time.monotonic() - start
+    ready = time.monotonic()
+    if timings is not None:
+        timings.update(started=start, requested=requested, responded=responded, ready=ready)
+        if pose_actions:
+            timings["ik_seconds"] = ik_seconds
+    return chunk, ready - start
+
+
+def _ms(seconds):
+    return 1000.0 * seconds
+
+
+def prediction_latency(timings, submitted_at):
+    """``PREDICTION_STAGES`` from ``checked_chunk`` timestamps and the time the request was submitted."""
+    ik_seconds = timings.get("ik_seconds")
+    stages = {
+        "queue_ms": _ms(timings["started"] - submitted_at),
+        "prepare_ms": _ms(timings["requested"] - timings["started"]),
+        "predict_ms": _ms(timings["responded"] - timings["requested"]),
+        "postprocess_ms": _ms(timings["ready"] - timings["responded"] - (ik_seconds or 0.0)),
+    }
+    if ik_seconds is not None:
+        stages["ik_ms"] = _ms(ik_seconds)
+    return stages
+
+
+def command_latency(timings, observed_at, accepted_at, commanded_at):
+    """``COMMAND_STAGES`` once the first row of an accepted prediction's plan is sent."""
+    return {
+        "ready_to_accept_ms": _ms(accepted_at - timings["ready"]),
+        "accept_to_command_ms": _ms(commanded_at - accepted_at),
+        "response_to_command_ms": _ms(commanded_at - timings["responded"]),
+        "observation_to_command_ms": _ms(commanded_at - observed_at),
+    }
+
+
+@dataclass
+class AcceptedPrediction:
+    """A prediction whose plan the control loop took, until its first row is sent."""
+
+    prediction_id: int
+    timings: dict
+    stages: dict
+    observed_at: float
+    accepted_at: float
+
+
+class LatencySpans:
+    """Send rollout latency to Grafana as spans, next to the Orchestral SDK's own.
+
+    - `yam.rollout.ik`: every prediction that ran IK (pose workers), whatever became of its chunk;
+      the duration is the IK solve.
+    - `yam.rollout.response_to_command`: every accepted prediction; the duration is the worker
+      response to the first new row sent.
+
+    Each span carries its prediction's stages as `yam.rollout.<stage>` attributes, its
+    `yam.rollout.outcome` (one of ``PREDICTION_OUTCOMES``), the family, `yam.rollout.shadow` and
+    `yam.rollout.chunk_fusion`, and the Session's own `orc.*` attributes. The SDK relays them with its
+    own spans, so they are sent only when it has telemetry credentials (`ORC_TELEMETRY_BASE_URL` and
+    `ORC_TELEMETRY_API_KEY` for a grant-only Session). Recording never stops the control loop.
+    """
+
+    ik_name = "yam.rollout.ik"
+    command_name = "yam.rollout.response_to_command"
+
+    def __init__(self, session, family, *, shadow, chunk_fusion):
+        try:
+            from orchestral.core import tracing
+        except ImportError:
+            tracing = None
+        self._tracing = tracing if callable(getattr(tracing, "record_span", None)) else None
+        if self._tracing is None:
+            print("[telemetry] This Orchestral SDK cannot record spans; rollout latency "
+                  "stays in the Rerun trace only.", flush=True)
+        attributes = getattr(session, "_trace_attributes", None)
+        self._attributes = attributes if callable(attributes) else dict
+        self._labels = {"yam.rollout.family": family, "yam.rollout.shadow": bool(shadow),
+                        "yam.rollout.chunk_fusion": chunk_fusion}
+        self._failed = False
+
+    def prediction(self, prediction_id, outcome, stages):
+        if "ik_ms" in stages:
+            self._record(self.ik_name, stages["ik_ms"], prediction_id, outcome, stages)
+
+    def command(self, prediction_id, stages):
+        self._record(self.command_name, stages["response_to_command_ms"], prediction_id, "accepted", stages)
+
+    def _record(self, name, duration_ms, prediction_id, outcome, stages):
+        if self._tracing is None or self._failed:
+            return
+        try:
+            end_ns = time.time_ns()
+            attributes = {**self._attributes(), **self._labels, "yam.rollout.prediction_id": prediction_id,
+                          "yam.rollout.outcome": outcome,
+                          **{f"yam.rollout.{stage}": round(value, 3) for stage, value in stages.items()}}
+            self._tracing.record_span(name, end_ns - round(duration_ms * 1e6), end_ns, attributes=attributes)
+        except Exception as error:  # telemetry must not interrupt the robot
+            self._failed = True
+            print(f"[telemetry] Stopped recording latency spans: {error}", flush=True)
+
+
+def latency_summary(prediction_samples, command_samples, tick_ms, outcomes):
+    """Lines of p50 / p95 / max per stage and the prediction outcomes, for the end-of-run printout."""
+    def row(name, values):
+        return (f"  {name:<27} {np.percentile(values, 50):8.1f} {np.percentile(values, 95):8.1f} "
+                f"{np.max(values):8.1f}")
+
+    lines = [f"Latency in ms over {len(prediction_samples)} predictions, "
+             f"{len(command_samples)} commanded:      p50      p95      max"]
+    for samples, stages in ((prediction_samples, PREDICTION_STAGES), (command_samples, COMMAND_STAGES)):
+        for stage in stages:
+            values = [sample[stage] for sample in samples if stage in sample]
+            if values:
+                lines.append(row(stage, values))
+    if tick_ms:
+        lines.append(row(TICK_STAGE, tick_ms))
+    lines.append("  outcomes: " + ", ".join(f"{name} {outcomes[name]}" for name in PREDICTION_OUTCOMES
+                                            if outcomes[name]))
+    return lines
+
+
+def observe(session, frames, joints, instruction, *, pose_actions=None, matrix_policy=False):
+    """Stream one observation; a pose worker's forward kinematics runs here, off the control tick."""
+    state = pose_actions.state(joints, matrix_policy=matrix_policy) if pose_actions else joints
+    session.observe(cameras=frames, state=state, instruction=instruction)
 
 
 def warm_session(session, instruction):
@@ -108,12 +248,28 @@ def warm_session(session, instruction):
         print(f"[gr00t] Warmup {i + 1}/3 finished in {duration * 1000:.0f} ms.", flush=True)
 
 
+def latency_line(label, call_ms, stage_rows, final=False):
+    """One line of prediction latency: the whole call (predict + IK) and the worker-reported stages."""
+    ms = np.asarray(call_ms)
+    p50, p95, p99 = np.percentile(ms, [50, 95, 99])
+    line = (f"[{label.lower()}] {'Final' if final else 'Running'} prediction latency over {len(ms)} calls "
+            f"(predict + IK): p50 {p50:.0f} ms, p95 {p95:.0f} ms, p99 {p99:.0f} ms, max {ms.max():.0f} ms")
+    if stage_rows:
+        def p(key, q):
+            values = [row[key] for row in stage_rows if row.get(key) is not None]
+            return float(np.percentile(values, q)) if values else float("nan")
+        line += ("; worker p50/p95: model {:.0f}/{:.0f} ms, network {:.0f}/{:.0f} ms, encode {:.0f}/{:.0f} ms"
+                 .format(p("model_ms", 50), p("model_ms", 95), p("network_ms", 50), p("network_ms", 95),
+                         p("encode_ms", 50), p("encode_ms", 95)))
+    return line
+
+
 def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
         camera_bindings=CAMERAS, history_offsets=(-3, 0), control_hz=CONTROL_HZ,
         action_shape=ACTION_SHAPE, model_label="GR00T", gripper_tolerance=None, pose_actions=None, matrix_policy=False,
         timestamp_observations=False, max_plan_rows=None, temporal_history=None, trace=None,
         state_padding=None, chunk_fusion="splice", fusion_rows=4, committed_actions=False,
-        stream_observations=False, noise_seed=None):
+        stream_observations=False, noise_seed=None, max_observed_rows=None):
     if committed_actions and (chunk_fusion != "splice" or lead_steps < 1):
         raise ValueError("Committed actions require splice and at least one prefetch lead step")
     period = 1 / control_hz
@@ -124,25 +280,35 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
     future = None
     active_prediction = 0
     submitted_with = 0
+    submitted_at = 0.0
     request_hold_ticks = 0
     request_prefix_changed = False
     observations = deque()
+    request_timings = {}
+    request_observed_at = request_submitted_at = None
+    awaiting_command = None  # an AcceptedPrediction until its first row is sent
+    prediction_samples, command_samples, tick_latencies_ms = [], [], []
+    outcomes = Counter()
+    latency_spans = LatencySpans(session, model_label, shadow=shadow, chunk_fusion=chunk_fusion)
     rejected_chunks = 0
     rows = predictions = handoffs = misses = holds = 0
     recorder = run_recording.current()
     tick = -1
+    call_ms, stage_rows = [], []
+    observed_since_prediction = 0
     next_tick = time.monotonic()
     started_at = next_tick
     deadline = next_tick + seconds
     predictor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"{model_label.lower()}-predict")
     try:
-        while time.monotonic() < deadline:
+        while (tick_started := time.monotonic()) < deadline:
             while observations and observations[0].done():
                 observations.popleft().result()
             tick += 1
             with recorder.span("get_obs"):
                 obs = env.get_obs()
-            observation_time = time.monotonic() - started_at if timestamp_observations else None
+            observed_at = time.monotonic()
+            observation_time = observed_at - started_at if timestamp_observations else None
             frames = frames_for_policy(obs, session.grant.io_spec.cameras, camera_bindings)
             history.append(frames)
             measured = mask.validate_state(obs["joint_positions"], name="policy input state")
@@ -158,26 +324,40 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                         trace.event("Prediction %d failed: %s", predictions, error)
                     raise
                 future = None
+                call_ms.append(elapsed * 1000)
+                try:
+                    stage_rows.append(session.step_timings[-1].stages_ms())
+                except (AttributeError, IndexError, TypeError):
+                    pass
+                if len(call_ms) % 20 == 0:
+                    print(latency_line(model_label, call_ms, stage_rows), flush=True)
                 # Each command sent since the request corresponds to one row of the new
                 # plan, which starts at the observation taken for this prediction.
                 # A missed deadline invalidates a prefetched plan. Wait for a fresh
                 # observation instead of applying a plan computed before the hold.
                 missed = bool(submitted_with and request_hold_ticks)
                 first_row = None if missed or request_prefix_changed else pending.add(chunk, request_slot)
-                outcome, reason = (("dropped", "unreachable") if not len(chunk) else ("dropped", "missed_boundary")
-                                   if missed else ("dropped", "mask_changed") if request_prefix_changed
-                                   else ("dropped", "stale") if first_row is None else ("accepted", None))
-                recorder.chunk(predictions, outcome=outcome, reason=reason, first_row=first_row,
+                outcome = ("unreachable" if not len(chunk) else "missed_boundary" if missed
+                           else "prefix_changed" if request_prefix_changed
+                           else "stale" if first_row is None else "accepted")
+                # Recorded for every chunk: IK is most likely to matter in the ones that came too late.
+                prediction_stages = prediction_latency(request_timings, request_submitted_at)
+                prediction_samples.append(prediction_stages)
+                outcomes[outcome] += 1
+                latency_spans.prediction(predictions, outcome, prediction_stages)
+                recorder.chunk(predictions, outcome="accepted" if outcome == "accepted" else "dropped",
+                               reason=None if outcome == "accepted" else outcome, first_row=first_row,
                                hold_ticks_while_waiting=request_hold_ticks, queued_rows_at_request=submitted_with,
                                fusion=chunk_fusion)
                 if trace is not None:
-                    if not len(chunk):
+                    trace.latency(prediction_stages)
+                    if outcome == "unreachable":
                         trace.event("Prediction %d rejected: unreachable plan", predictions)
-                    elif missed:
+                    elif outcome == "missed_boundary":
                         trace.event("Prediction %d dropped after %d hold ticks", predictions, request_hold_ticks)
-                    elif request_prefix_changed:
+                    elif outcome == "prefix_changed":
                         trace.event("Prediction %d dropped after the safety mask changed a committed target", predictions)
-                    elif first_row is None:
+                    elif outcome == "stale":
                         trace.event("Prediction %d dropped: every row was stale", predictions)
                     else:
                         trace.event("Prediction %d accepted starting at row %d", predictions, first_row)
@@ -189,11 +369,16 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                         raise SystemExit(f"{model_label} returned three consecutive unreachable plans; rollout stopped")
                 if missed:
                     misses += 1
-                    print(f"[{model_label.lower()}] Prefetch missed the boundary ({elapsed * 1000:.0f} ms). "
-                          "Replanning.", flush=True)
+                    # elapsed is predict + IK only; since-request also counts time queued behind observe() calls.
+                    print(f"[{model_label.lower()}] Prefetch missed the boundary ({elapsed * 1000:.0f} ms; "
+                          f"{(time.monotonic() - submitted_at) * 1000:.0f} ms since request, requested with "
+                          f"{submitted_with} queued rows, {request_hold_ticks} hold ticks, prediction {predictions}, "
+                          f"{time.monotonic() - started_at:.1f} s into the run). Replanning.", flush=True)
                 elif first_row is not None:
                     active_prediction = predictions
                     handoffs += bool(submitted_with)
+                    awaiting_command = AcceptedPrediction(predictions, request_timings, prediction_stages,
+                                                          request_observed_at, time.monotonic())
             if len(history) == history_size and future is None and len(pending) <= lead_steps:
                 cameras = (
                     {name: np.stack([history[offset - 1][name] for offset in history_offsets])
@@ -204,6 +389,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 if temporal_history is not None:
                     cameras, history_inputs = temporal_history.inputs()
                 submitted_with = len(pending)
+                submitted_at = time.monotonic()
                 request_slot = pending.slot
                 request_hold_ticks = 0
                 request_prefix_changed = False
@@ -211,8 +397,11 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 handle = recorder.observation(prediction=predictions + 1, queued_rows=submitted_with,
                                               committed_rows=0 if prefix is None else len(prefix),
                                               lead_steps=lead_steps)
+                request_timings = {}
+                request_observed_at = observed_at
                 if trace is not None:
                     trace.event("Prediction %d requested with %d queued rows", predictions + 1, submitted_with)
+                request_submitted_at = time.monotonic()
                 future = predictor.submit(checked_chunk, session, cameras, measured[:7].copy(),
                                           instruction, episode_start=(predictions == 0),
                                           action_shape=action_shape, model_label=model_label,
@@ -221,20 +410,24 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                                           max_plan_rows=max_plan_rows, history_inputs=history_inputs,
                                           trace=trace, prediction_id=predictions + 1,
                                           state_padding=state_padding, committed_actions=prefix, noise_seed=noise_seed,
+                                          timings=request_timings,
                                           observation=handle)
                 predictions += 1
+                observed_since_prediction = 0
             elif stream_observations:
                 # Use the prediction executor to preserve Session order without blocking the control tick.
-                observed_state = (
-                    pose_actions.state(measured[:7].copy(), matrix_policy=matrix_policy)
-                    if pose_actions else measured[:7].copy()
-                )
-                observations.append(predictor.submit(
-                    session.observe, cameras=frames, state=observed_state, instruction=instruction,
-                ))
+                # It also runs a pose worker's forward kinematics, so the command below does not wait for it;
+                # the single worker thread never uses pose_actions from two threads at once.
+                # `max_observed_rows` bounds the frames sent between two predictions: see managed_rollout.
+                if max_observed_rows is None or observed_since_prediction < max_observed_rows:
+                    observed_since_prediction += 1
+                    observations.append(predictor.submit(
+                        observe, session, frames, measured[:7].copy(), instruction,
+                        pose_actions=pose_actions, matrix_policy=matrix_policy,
+                    ))
 
             next_tick += period
-            row = command = row_index = None
+            row = command = row_index = tick_ms = None
             if pending and time.monotonic() < deadline:
                 row_index, row = pending.pop()
                 if not shadow:
@@ -252,7 +445,19 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                     if temporal_history is not None:
                         temporal_history.commanded(command[:7])
                 rows += 1
-                next_tick = max(next_tick, time.monotonic() + period)
+                commanded_at = time.monotonic()
+                next_tick = max(next_tick, commanded_at + period)
+                tick_ms = 1000.0 * (commanded_at - tick_started)
+                tick_latencies_ms.append(tick_ms)
+                if awaiting_command is not None:
+                    accepted, awaiting_command = awaiting_command, None
+                    stages = command_latency(accepted.timings, accepted.observed_at, accepted.accepted_at,
+                                             commanded_at)
+                    command_samples.append(stages)
+                    latency_spans.command(accepted.prediction_id, {**accepted.stages, **stages})
+                    if trace is not None:
+                        trace.latency(stages, event=f"Prediction {accepted.prediction_id} first row commanded "
+                                                    f"{stages['response_to_command_ms']:.0f} ms after the response")
             elif future is not None:
                 request_hold_ticks += 1
                 holds += 1
@@ -261,10 +466,16 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                           else "idle", tick_elapsed_ms=1000 * (time.monotonic() - next_tick + period))
             if trace is not None:
                 trace.tick(measured, row, command, active_prediction, row_index,
-                           holding=row is None and future is not None)
+                           holding=row is None and future is not None, tick_ms=tick_ms)
             time.sleep(max(0, next_tick - time.monotonic()))
     finally:
         predictor.shutdown(wait=False, cancel_futures=True)
+        # Printed on Ctrl+C too: that is how an operator ends most rollouts.
+        if call_ms:
+            print(latency_line(model_label, call_ms, stage_rows, final=True), flush=True)
+        if prediction_samples:
+            print("\n".join(latency_summary(prediction_samples, command_samples, tick_latencies_ms, outcomes)),
+                  flush=True)
     print(f"{model_label} rollout finished. {predictions} predictions, {rows} {'shadow rows' if shadow else 'commands'}, "
           f"{handoffs} prefetched handoffs, {misses} missed boundaries, {holds} hold ticks.")
 
