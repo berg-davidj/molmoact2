@@ -32,6 +32,7 @@ class DeploymentCameraMappingTests(unittest.TestCase):
         layouts = [
             (GR00T_YAM_ADAPTER, ("top_left", "wrist_left", "wrist_right")),
             (GR00T_YAM_ADAPTER, ("belt", "wrist")),
+            ("identity", ("observation.images.top_left", "observation.images.wrist_left")),
             (TEMPORAL_JOINT_ADAPTER, ("images.middle", "images.left")),
             (TEMPORAL_JOINT_ADAPTER, ("images.middle", "images.left", "images.right")),
             ("identity", ("observation.images.top", "observation.images.left_wrist")),

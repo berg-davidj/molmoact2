@@ -330,7 +330,8 @@ def rollout_joint_policy(host, identity, args):
                         chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows,
                         state_padding=ISAAC_PARKED_RIGHT_ARM if bimanual_layout else None,
                         trace=trace,
-                        committed_actions=committed, stream_observations=family == "longwam",
+                        committed_actions=committed,
+                        stream_observations=family in {"longwam", "praxis1"},
                         noise_seed=args.noise_seed,
                     )
                 finally:
