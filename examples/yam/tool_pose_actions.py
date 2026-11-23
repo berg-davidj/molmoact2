@@ -35,6 +35,7 @@ class ToolPoseActions:
         if not all(self.model.jnt_type[joints] == mujoco.mjtJoint.mjJNT_HINGE) or not all(self.model.jnt_limited[joints]):
             raise ValueError("Tool pose conversion requires six limited hinge joints")
         self.qpos = self.model.jnt_qposadr[joints]
+        self.dof = self.model.jnt_dofadr[joints]
         self.lower, self.upper = self.model.jnt_range[joints].T
         if not np.isfinite(max_joint_step_rad) or not 0 < max_joint_step_rad < np.pi:
             raise ValueError("max_joint_step_rad must be between zero and pi")
@@ -86,6 +87,65 @@ class ToolPoseActions:
                 rows.append(np.r_[position, rotation[:2].ravel(), target[6]])
         return np.asarray(rows, dtype=np.float32)
 
+    def _frame_rotation(self):
+        """Rotation from the base frame to the policy frame; None when they coincide."""
+        return None
+
+    def _jacobian(self, data, joints):
+        """Position and angular Jacobians of the tool in the policy frame (3 x 6 each)."""
+        mj = self._mj
+        data.qpos[self.qpos] = joints
+        mj.mj_kinematics(self.model, data)
+        mj.mj_comPos(self.model, data)
+        jacp, jacr = np.zeros((3, self.model.nv)), np.zeros((3, self.model.nv))
+        mj.mj_jacBody(self.model, data, jacp, jacr, self.tool)
+        base = data.xmat[self.base].reshape(3, 3).T
+        position, angular = base @ jacp[:, self.dof], base @ jacr[:, self.dof]
+        frame = self._frame_rotation()
+        return (position, angular) if frame is None else (frame @ position, frame @ angular)
+
+    def _damped_solve(self, data, target_position, target_rotation, start, lower, upper):
+        """Levenberg-Marquardt with an analytic Jacobian, inside the joint box; None when it does not converge.
+
+        Same residual and acceptance as the ``least_squares`` fallback in ``_solve``, which handles every
+        case this does not reach, so a target is reachable exactly when it was before.
+        """
+        position_tolerance, rotation_tolerance = self.position_tolerance, self.rotation_tolerance
+
+        def residual(joints):
+            position, rotation = self._pose(data, joints)
+            return np.concatenate((
+                (target_position - position) / position_tolerance,
+                self._rotvec(target_rotation @ rotation.T) / rotation_tolerance,
+            ))
+
+        joints = start
+        error = residual(joints)
+        cost = error @ error
+        damping = 1e-2
+        for _ in range(25):
+            if np.linalg.norm(error[:3]) <= 0.1 and np.linalg.norm(error[3:]) <= 0.1:
+                break
+            position, angular = self._jacobian(data, joints)
+            jacobian = -np.vstack((position / position_tolerance, angular / rotation_tolerance))
+            gradient = jacobian.T @ error
+            normal = jacobian.T @ jacobian
+            for _ in range(8):
+                step = -np.linalg.solve(normal + damping * np.diag(np.diag(normal) + 1e-9), gradient)
+                trial = np.clip(joints + step, lower, upper)
+                trial_error = residual(trial)
+                trial_cost = trial_error @ trial_error
+                if trial_cost < cost:
+                    joints, error, cost = trial, trial_error, trial_cost
+                    damping = max(damping * 0.3, 1e-9)
+                    break
+                damping *= 10
+            else:
+                break
+        if np.linalg.norm(error[:3]) <= self.accept_norm and np.linalg.norm(error[3:]) <= self.accept_norm:
+            return joints
+        return None
+
     def _solve(self, data, target_position, target_rotation, previous, max_step=None):
         max_step = self.max_step if max_step is None else max_step
         lower = np.maximum(self.lower, previous - max_step)
@@ -107,6 +167,9 @@ class ToolPoseActions:
         error = residual(joints)
         if np.linalg.norm(error[:3]) <= 1 and np.linalg.norm(error[3:]) <= 1:
             return joints
+        fast = self._damped_solve(data, target_position, target_rotation, joints, lower, upper)
+        if fast is not None:
+            return fast
         result = least_squares(residual, joints, bounds=(lower, upper), max_nfev=40)
         if np.linalg.norm(result.fun[:3]) <= self.accept_norm and np.linalg.norm(result.fun[3:]) <= self.accept_norm:
             return result.x
@@ -176,6 +239,9 @@ class QuatToolPoseActions(ToolPoseActions):
                 or not np.allclose(self._base_rotation @ self._base_rotation.T, np.eye(3), atol=1e-6)
                 or np.linalg.det(self._base_rotation) <= 0):
             raise ValueError("Base transform needs a proper 3x3 rotation and a 3-vector translation")
+
+    def _frame_rotation(self):
+        return self._base_rotation
 
     def _pose(self, data, joints):
         position, rotation = super()._pose(data, joints)
