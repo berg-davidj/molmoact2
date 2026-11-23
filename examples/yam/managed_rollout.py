@@ -43,6 +43,7 @@ CONTROL_HZ_30_FAMILIES = frozenset({"flux3-action", "longwam", "rho", "aw0"})
 PARKED_RIGHT_ARM_FAMILIES = frozenset({"isaac05", "aw0"})
 # Rows of each chunk the rollout executes before replanning. Upstream DW05 runs 8 of its 32 rows.
 DEFAULT_PLAN_ROWS = {"verne": 4, "dw05": 8}
+PRAXIS_MAX_OBSERVED_ROWS = 19
 NOISE_SEED_FAMILIES = frozenset({"pi05", "flux3-action", "longwam", "praxis1"})
 # The rig's arm swap belongs to this checkpoint, not to every bimanual Praxis model.
 PRAXIS_HOLESAW_BIMANUAL_CHECKPOINT = (
@@ -332,6 +333,11 @@ def rollout_joint_policy(host, identity, args):
                         trace=trace,
                         committed_actions=committed,
                         stream_observations=family in {"longwam", "praxis1"},
+                        # Praxis encodes the window it is sent. With 20 or more observed frames between two predictions
+                        # but fewer than a full 24, the Worker rebuilds the whole window at call time: 106-127 ms instead
+                        # of 30 ms, whenever the count lands there (and on the second call of every run). 19 or fewer
+                        # takes the cold-start path (about 30 ms) every time.
+                        max_observed_rows=PRAXIS_MAX_OBSERVED_ROWS if family == "praxis1" else None,
                         noise_seed=args.noise_seed,
                     )
                 finally:
