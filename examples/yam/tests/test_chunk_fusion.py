@@ -272,10 +272,11 @@ def test_checked_chunk_clips_flux_gripper_overshoot_before_queueing():
     np.testing.assert_array_equal(chunk[:, :6], raw[:, :6])
     np.testing.assert_array_equal(chunk[:, 6], np.minimum(raw[:, 6], 1.0))
     assert raw[-1, 6] > 1.05
-    for invalid in (1.061, -0.061):
-        raw[-1, 6] = invalid
-        with pytest.raises(ValueError, match="outside the accepted aperture range"):
-            predict()
+    raw[-1, 6] = -0.069
+    assert predict()[-1, 6] == 0.0
+    raw[-1, 6] = np.nan
+    with pytest.raises(ValueError, match="invalid action chunk"):
+        predict()
 
 
 def test_checked_chunk_rejects_changed_committed_rows():

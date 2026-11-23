@@ -4,7 +4,6 @@ import numpy as np
 
 # These bounds apply to raw model output, before clipping the motor command.
 _PREDICTION_BOUNDS = {
-    "flux3-action": (-0.06, 1.06),
     "longwam": (-0.06, 1.06),
     "molmoact2": (-0.15, 1.15),
 }
@@ -12,7 +11,7 @@ _PREDICTION_BOUNDS = {
 
 # Diffusion and flow-matching heads overshoot the gripper range slightly. These families clip it
 # to [0, 1] instead of aborting the rollout; a non-finite value still aborts.
-_CLIPPED_LABELS = frozenset({"dreamzero", "fastwam", "dw05", "aw0", "rho"})
+_CLIPPED_LABELS = frozenset({"flux3-action", "dreamzero", "fastwam", "dw05", "aw0", "rho"})
 
 
 def clip_predicted_aperture(gripper, model_label, *, tolerance=None):

@@ -368,10 +368,14 @@ def rollout_joint_policy(host, identity, args):
                     )
                 finally:
                     try:
-                        env.close()
+                        # The recorder exports through the robot's native worker, so it must close first.
+                        stack.close()
                     finally:
-                        if trace is not None:
-                            trace.stop()
+                        try:
+                            env.close()
+                        finally:
+                            if trace is not None:
+                                trace.stop()
     finally:
         recording.disconnect()
     print(f"[rerun] Saved {', '.join(f'{name}={count}' for name, count in frame_counts.items())} frames to {output_path}",

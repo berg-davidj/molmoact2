@@ -42,7 +42,7 @@ def test_seeded_probe_checks_both_prediction_paths(family):
 
 
 @pytest.mark.parametrize("bad_prediction", [1, 2])
-def test_flux_probe_checks_the_whole_gripper_plan(bad_prediction):
+def test_flux_probe_rejects_non_finite_gripper_plan(bad_prediction):
     calls = []
 
     def predict(**kwargs):
@@ -53,7 +53,7 @@ def test_flux_probe_checks_the_whole_gripper_plan(bad_prediction):
             assert kwargs["committed_actions"][0, 6] == 1.0
             actions[:1] = kwargs["committed_actions"]
         if len(calls) == bad_prediction:
-            actions[-1, 6] = 1.061
+            actions[-1, 6] = np.nan
         return SimpleNamespace(actions=actions)
 
     host = SimpleNamespace(
@@ -61,7 +61,7 @@ def test_flux_probe_checks_the_whole_gripper_plan(bad_prediction):
         session=SimpleNamespace(predict=predict, grant=SimpleNamespace(io_spec=SimpleNamespace(cameras={}))),
         supports_committed_actions=lambda: True,
     )
-    with pytest.raises(ValueError, match="outside the accepted aperture range"):
+    with pytest.raises(SystemExit, match="finite"):
         managed_rollout.probe(host, "flux3-action", "go")
     assert len(calls) == bad_prediction
 
