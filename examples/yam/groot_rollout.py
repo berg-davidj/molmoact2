@@ -17,6 +17,7 @@ import rerun as rr
 import rerun.blueprint as rrb
 
 from chunk_fusion import MODES as CHUNK_FUSION_MODES, ChunkPlan
+from gripper_aperture import clip_predicted_aperture
 from rollout_trace import RolloutTrace
 
 CAMERAS = {"belt": "front_camera_rgb", "wrist": "left_camera_rgb"}
@@ -36,7 +37,7 @@ def frames_for_policy(obs, camera_shapes, camera_bindings=CAMERAS):
 
 
 def checked_chunk(session, cameras, state, instruction, *, episode_start, action_shape=ACTION_SHAPE,
-                  model_label="GR00T", gripper_tolerance=0.05, pose_actions=None, matrix_policy=False,
+                  model_label="GR00T", gripper_tolerance=None, pose_actions=None, matrix_policy=False,
                   observation_time=None, max_plan_rows=None, history_inputs=None, trace=None, prediction_id=0,
                   state_padding=None, committed_actions=None, noise_seed=None):
     start = time.monotonic()
@@ -87,15 +88,8 @@ def checked_chunk(session, cameras, state, instruction, *, episode_start, action
                 chunk = np.concatenate((kept, solved))
             except UnreachableToolPose as error:
                 print(f"[{model_label.lower()}] {error}. Replanning after the queued targets.", flush=True)
-    gripper = chunk[:, 6]
-    lower, upper = -gripper_tolerance, 1.0 + gripper_tolerance
-    if np.any((gripper < lower) | (gripper > upper)):
-        raise ValueError(
-            f"{model_label} returned gripper targets ranging from {gripper.min():.4f} to "
-            f"{gripper.max():.4f}, outside the accepted aperture range [{lower:.2f}, {upper:.2f}]"
-        )
     chunk = chunk.copy()
-    chunk[:, 6] = np.clip(chunk[:, 6], 0, 1)
+    chunk[:, 6] = clip_predicted_aperture(chunk[:, 6], model_label, tolerance=gripper_tolerance)
     return chunk, time.monotonic() - start
 
 
@@ -110,7 +104,7 @@ def warm_session(session, instruction):
 
 def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
         camera_bindings=CAMERAS, history_offsets=(-3, 0), control_hz=CONTROL_HZ,
-        action_shape=ACTION_SHAPE, model_label="GR00T", gripper_tolerance=0.05, pose_actions=None, matrix_policy=False,
+        action_shape=ACTION_SHAPE, model_label="GR00T", gripper_tolerance=None, pose_actions=None, matrix_policy=False,
         timestamp_observations=False, max_plan_rows=None, temporal_history=None, trace=None,
         state_padding=None, chunk_fusion="splice", fusion_rows=4, committed_actions=False,
         stream_observations=False, noise_seed=None):

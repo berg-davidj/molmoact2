@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from chunk_fusion import MODES as CHUNK_FUSION_MODES
+from gripper_aperture import clip_predicted_aperture
 from rollout_compare import record_settings
 from orchestral import Orchestral
 from orchestral.core.tailnet import ManagedTailnetNode, TailscaleCli
@@ -22,8 +23,6 @@ from orchestral.core.tailnet import ManagedTailnetNode, TailscaleCli
 DEFAULT_DEPLOYMENT = "steady-ape-3roj"
 LEFT_CONFIG = "examples/yam/configs/pi05_holesaw_conveyor_left.yaml"
 RIGHT_CONFIG = "examples/yam/configs/yam_deployment_right.yaml"
-# Allow MolmoAct2 to overshoot aperture endpoints before the rollout clips to [0, 1].
-MOLMOACT2_GRIPPER_TOLERANCE = 0.15
 # Isaac 0.5 YAM checkpoints keep the release's bimanual layout: left arm in channels 0-6,
 # right arm in 7-13. The Holesaw fine-tune saw the parked right arm as this constant
 # (joints 0, gripper open), so the rollout sends exactly it and uses only the left columns.
@@ -117,6 +116,8 @@ def probe(host, family, instruction, *, committed_actions=False, noise_seed=None
     expected = (host.identity["action_horizon"], host.identity["action_dim"])
     if actions.shape != expected or not np.isfinite(actions).all():
         raise SystemExit(f"{family} did not return a finite action chunk of shape {expected}.")
+    if family == "flux3-action":
+        clip_predicted_aperture(actions[:, 6], family)
     if committed_actions:
         if family == "longwam":
             host.session.observe(**predict)
@@ -130,6 +131,8 @@ def probe(host, family, instruction, *, committed_actions=False, noise_seed=None
         )
         if continued.shape != expected or not np.isfinite(continued).all() or not np.array_equal(continued[:1], prefix):
             raise SystemExit(f"{family} did not return a finite chunk preserving the committed action.")
+        if family == "flux3-action":
+            clip_predicted_aperture(continued[:, 6], family)
     host.begin_episode()
     status = " and preserved a committed row" if committed_actions else ""
     print(f"Staging {family} returned a finite {expected[0]} × {expected[1]} action chunk "
@@ -265,11 +268,6 @@ def rollout_joint_policy(host, identity, args):
                         temporal_history=temporal_history,
                         chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows,
                         state_padding=ISAAC_PARKED_RIGHT_ARM if bimanual_layout else None,
-                        gripper_tolerance=(
-                            MOLMOACT2_GRIPPER_TOLERANCE if family == "molmoact2"
-                            else 0.06 if family == "longwam"
-                            else 0.05
-                        ),
                         trace=trace,
                         committed_actions=args.committed_actions, stream_observations=family == "longwam",
                         noise_seed=args.noise_seed,

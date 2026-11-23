@@ -221,6 +221,28 @@ def test_rollout_commits_the_queued_targets_before_appending_a_suffix(bimanual, 
             assert prediction_kwargs["noise_seed"] == noise_seed
 
 
+def test_checked_chunk_clips_flux_gripper_overshoot_before_queueing():
+    import groot_rollout
+
+    raw = ramp(0)
+    raw[:, 6] = np.linspace(0.9199, 1.0504, len(raw))
+    session = SimpleNamespace(predict=lambda **kwargs: SimpleNamespace(actions=raw))
+
+    def predict():
+        chunk, _ = groot_rollout.checked_chunk(session, {}, np.zeros(7), "go", episode_start=True,
+                                               model_label="flux3-action")
+        return chunk
+
+    chunk = predict()
+    np.testing.assert_array_equal(chunk[:, :6], raw[:, :6])
+    np.testing.assert_array_equal(chunk[:, 6], np.minimum(raw[:, 6], 1.0))
+    assert raw[-1, 6] > 1.05
+    for invalid in (1.061, -0.051):
+        raw[-1, 6] = invalid
+        with pytest.raises(ValueError, match="outside the accepted aperture range"):
+            predict()
+
+
 def test_checked_chunk_rejects_changed_committed_rows():
     groot_rollout = pytest.importorskip("groot_rollout")
     session = SimpleNamespace(predict=lambda **kwargs: SimpleNamespace(actions=np.zeros((16, 7))))

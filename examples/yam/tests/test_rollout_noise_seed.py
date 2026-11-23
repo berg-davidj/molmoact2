@@ -41,6 +41,31 @@ def test_seeded_probe_checks_both_prediction_paths(family):
         assert "noise_seed" not in observations[0]
 
 
+@pytest.mark.parametrize("bad_prediction", [1, 2])
+def test_flux_probe_checks_the_whole_gripper_plan(bad_prediction):
+    calls = []
+
+    def predict(**kwargs):
+        calls.append(kwargs)
+        actions = np.zeros((16, 7), dtype=np.float32)
+        actions[:, 6] = 1.0504
+        if "committed_actions" in kwargs:
+            assert kwargs["committed_actions"][0, 6] == 1.0
+            actions[:1] = kwargs["committed_actions"]
+        if len(calls) == bad_prediction:
+            actions[-1, 6] = 1.061
+        return SimpleNamespace(actions=actions)
+
+    host = SimpleNamespace(
+        identity=dict(state_dim=7, action_dim=7, action_horizon=16, camera_mapping={"top": "scene"}),
+        session=SimpleNamespace(predict=predict, grant=SimpleNamespace(io_spec=SimpleNamespace(cameras={}))),
+        supports_committed_actions=lambda: True,
+    )
+    with pytest.raises(ValueError, match="outside the accepted aperture range"):
+        managed_rollout.probe(host, "flux3-action", "go", committed_actions=True)
+    assert len(calls) == bad_prediction
+
+
 def test_praxis_probe_preserves_the_rotation_and_zero_seed():
     calls = []
     pose = np.array([.3, .1, .3, 0, 1, 0, -1, 0, 0, 0, 0, 1, .75], np.float32)
