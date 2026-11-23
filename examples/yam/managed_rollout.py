@@ -43,7 +43,19 @@ CONTROL_HZ_30_FAMILIES = frozenset({"flux3-action", "longwam", "rho", "aw0"})
 PARKED_RIGHT_ARM_FAMILIES = frozenset({"isaac05", "aw0"})
 # Rows of each chunk the rollout executes before replanning. Upstream DW05 runs 8 of its 32 rows.
 DEFAULT_PLAN_ROWS = {"verne": 4, "dw05": 16}
+# How successive chunks are joined when --chunk-fusion is not given. `splice` waits for the queued rows to run out, so a chunk
+# that arrives after ~72 ms sat ~212 ms before use (observation-to-command 288 ms for DW05 on the robot); `crossfade` takes it
+# on arrival (140 ms). Committed actions need splice, so they always use it.
+CHUNK_FUSION_DEFAULTS = {"dw05": "crossfade"}
+# A fused mode lets the newest chunk replace the queued gripper plan at once, and on the robot that released the gripper early
+# (each chunk's gripper transition time jitters, so the first chunk that lands early fires it). These families keep the queued
+# plan's gripper for the next N slots (chunk_fusion.ChunkPlan hold_gripper_rows): one chunk, not the earliest of several, decides.
+HOLD_GRIPPER_ROWS = {"dw05": 4}
 PRAXIS_MAX_OBSERVED_ROWS = 19
+
+
+def default_chunk_fusion(family, committed):
+    return "splice" if committed else CHUNK_FUSION_DEFAULTS.get(family, "splice")
 NOISE_SEED_FAMILIES = frozenset({"pi05", "flux3-action", "longwam", "praxis1"})
 # The rig's arm swap belongs to this checkpoint, not to every bimanual Praxis model.
 PRAXIS_HOLESAW_BIMANUAL_CHECKPOINT = (
@@ -229,6 +241,8 @@ def rollout_joint_policy(host, identity, args):
     if lead_steps >= plan_rows:
         raise SystemExit(f"--prefetch-lead-steps must be below the rollout plan length ({plan_rows})")
     committed = committed_enabled(family, args)
+    if args.chunk_fusion is None:
+        args.chunk_fusion = default_chunk_fusion(family, committed)
     if committed and (args.chunk_fusion != "splice" or lead_steps < 1):
         raise SystemExit("Committed actions are on: use --chunk-fusion splice and at least one prefetch lead step.")
     temporal_history = None
@@ -330,6 +344,7 @@ def rollout_joint_policy(host, identity, args):
                         timestamp_observations=family in {"verne", "isaac05"}, max_plan_rows=plan_rows,
                         temporal_history=temporal_history,
                         chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows,
+                        hold_gripper_rows=HOLD_GRIPPER_ROWS.get(family, 0),
                         state_padding=ISAAC_PARKED_RIGHT_ARM if bimanual_layout else None,
                         trace=trace,
                         committed_actions=committed,
@@ -655,7 +670,8 @@ def main():
                           help="rows of each chunk to execute before replanning (default: the family's, else the whole chunk)")
     settings.add_argument("--prefetch-lead-steps", type=int)
     # How successive action chunks are joined; chunk_fusion.py describes each mode.
-    settings.add_argument("--chunk-fusion", choices=CHUNK_FUSION_MODES, default="splice")
+    settings.add_argument("--chunk-fusion", choices=CHUNK_FUSION_MODES, default=None,
+                          help="default: crossfade for dw05, splice otherwise (committed actions always splice)")
     settings.add_argument("--fusion-rows", type=int, default=4,
                           help="Ticks over which crossfade and rail move onto a new chunk")
     settings.add_argument("--shadow", action="store_true")
@@ -681,6 +697,8 @@ def main():
         settings.error("--prefetch-lead-steps must be nonnegative")
     # Committed actions (RTC) need splice handoffs and at least one queued row.
     args.committed_actions = committed_enabled(family, args)
+    if args.chunk_fusion is None:
+        args.chunk_fusion = default_chunk_fusion(family, args.committed_actions)
     if target.soak_hours <= 0 and args.committed_actions and (
             args.chunk_fusion != "splice" or args.prefetch_lead_steps == 0):
         settings.error("committed actions are on: use --chunk-fusion splice and --prefetch-lead-steps of at least 1")

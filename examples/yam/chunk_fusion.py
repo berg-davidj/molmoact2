@@ -58,13 +58,19 @@ def _rail_bridge(start, end, rows):
 class ChunkPlan:
     """The queue of rows still to be commanded, fused from the chunks added to it."""
 
-    def __init__(self, mode="splice", *, blend_rows=4):
+    def __init__(self, mode="splice", *, blend_rows=4, hold_gripper_rows=0):
         if mode not in MODES:
             raise ValueError(f"Unknown chunk fusion mode {mode!r}; choose from {', '.join(MODES)}")
         if blend_rows < 1:
             raise ValueError("blend_rows must be at least 1")
         self.mode = mode
         self.blend_rows = blend_rows
+        # The gripper is never blended, but by default every new chunk replaces the queued gripper plan at once, so the
+        # first chunk whose jittered transition lands early fires it. With hold_gripper_rows=N the next N queued slots keep
+        # the gripper the queued plan already had; only slots beyond follow the newest chunk (joints still fuse).
+        if hold_gripper_rows < 0:
+            raise ValueError("hold_gripper_rows must not be negative")
+        self.hold_gripper_rows = hold_gripper_rows
         self.slot = 0  # the next command slot; equals the number of rows popped so far
         self._queue = deque()  # (row index in its chunk, row), one per upcoming slot
         self._votes = deque()  # ensemble only: every chunk's joint prediction per queued slot
@@ -104,6 +110,8 @@ class ChunkPlan:
         return stale
 
     def _replace(self, rows, first_index):
+        for k in range(min(self.hold_gripper_rows, len(rows), len(self._queue))):
+            rows[k, -1] = self._queue[k][1][-1]
         self._queue = deque(enumerate(rows, start=first_index))
 
     def _splice(self, chunk, stale):

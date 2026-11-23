@@ -265,13 +265,13 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
         action_shape=ACTION_SHAPE, model_label="GR00T", gripper_tolerance=None, pose_actions=None, matrix_policy=False,
         timestamp_observations=False, max_plan_rows=None, temporal_history=None, trace=None,
         state_padding=None, chunk_fusion="splice", fusion_rows=4, committed_actions=False,
-        stream_observations=False, noise_seed=None, max_observed_rows=None):
+        stream_observations=False, noise_seed=None, max_observed_rows=None, hold_gripper_rows=0):
     if committed_actions and (chunk_fusion != "splice" or lead_steps < 1):
         raise ValueError("Committed actions require splice and at least one prefetch lead step")
     period = 1 / control_hz
     history_size = 1 - min(history_offsets, default=0)
     history = deque(maxlen=history_size)
-    pending = ChunkPlan(chunk_fusion, blend_rows=fusion_rows)
+    pending = ChunkPlan(chunk_fusion, blend_rows=fusion_rows, hold_gripper_rows=hold_gripper_rows)
     request_slot = 0
     future = None
     active_prediction = 0
