@@ -196,6 +196,22 @@ def warm_session(session, instruction):
         print(f"[gr00t] Warmup {i + 1}/3 finished in {duration * 1000:.0f} ms.", flush=True)
 
 
+def latency_line(label, call_ms, stage_rows, final=False):
+    """One line of prediction latency: the whole call (predict + IK) and the worker-reported stages."""
+    ms = np.asarray(call_ms)
+    p50, p95, p99 = np.percentile(ms, [50, 95, 99])
+    line = (f"[{label.lower()}] {'Final' if final else 'Running'} prediction latency over {len(ms)} calls "
+            f"(predict + IK): p50 {p50:.0f} ms, p95 {p95:.0f} ms, p99 {p99:.0f} ms, max {ms.max():.0f} ms")
+    if stage_rows:
+        def p(key, q):
+            values = [row[key] for row in stage_rows if row.get(key) is not None]
+            return float(np.percentile(values, q)) if values else float("nan")
+        line += ("; worker p50/p95: model {:.0f}/{:.0f} ms, network {:.0f}/{:.0f} ms, encode {:.0f}/{:.0f} ms"
+                 .format(p("model_ms", 50), p("model_ms", 95), p("network_ms", 50), p("network_ms", 95),
+                         p("encode_ms", 50), p("encode_ms", 95)))
+    return line
+
+
 def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
         camera_bindings=CAMERAS, history_offsets=(-3, 0), control_hz=CONTROL_HZ,
         action_shape=ACTION_SHAPE, model_label="GR00T", gripper_tolerance=None, pose_actions=None, matrix_policy=False,
@@ -223,6 +239,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
     tick_latencies_ms = []
     rejected_chunks = 0
     rows = predictions = handoffs = misses = holds = 0
+    call_ms, stage_rows = [], []
     next_tick = time.monotonic()
     started_at = next_tick
     deadline = next_tick + seconds
@@ -249,6 +266,13 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                         trace.event("Prediction %d failed: %s", predictions, error)
                     raise
                 future = None
+                call_ms.append(elapsed * 1000)
+                try:
+                    stage_rows.append(session.step_timings[-1].stages_ms())
+                except (AttributeError, IndexError, TypeError):
+                    pass
+                if len(call_ms) % 20 == 0:
+                    print(latency_line(model_label, call_ms, stage_rows), flush=True)
                 # Each command sent since the request corresponds to one row of the new
                 # plan, which starts at the observation taken for this prediction.
                 # A missed deadline invalidates a prefetched plan. Wait for a fresh
@@ -357,6 +381,8 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
     finally:
         predictor.shutdown(wait=False, cancel_futures=True)
         # Printed on Ctrl+C too: that is how an operator ends most rollouts.
+        if call_ms:
+            print(latency_line(model_label, call_ms, stage_rows, final=True), flush=True)
         if latency_samples:
             print("\n".join(latency_summary(latency_samples, tick_latencies_ms)), flush=True)
     print(f"{model_label} rollout finished. {predictions} predictions, {rows} {'shadow rows' if shadow else 'commands'}, "
