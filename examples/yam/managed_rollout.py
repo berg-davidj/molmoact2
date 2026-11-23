@@ -261,7 +261,11 @@ def rollout_joint_policy(host, identity, args):
                         temporal_history=temporal_history,
                         chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows,
                         state_padding=ISAAC_PARKED_RIGHT_ARM if bimanual_layout else None,
-                        gripper_tolerance=MOLMOACT2_GRIPPER_TOLERANCE if family == "molmoact2" else 0.05,
+                        gripper_tolerance=(
+                            MOLMOACT2_GRIPPER_TOLERANCE if family == "molmoact2"
+                            else 0.06 if family == "longwam"
+                            else 0.05
+                        ),
                         trace=trace,
                         committed_actions=args.committed_actions, stream_observations=family == "longwam",
                         noise_seed=args.noise_seed,
