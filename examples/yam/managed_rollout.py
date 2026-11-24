@@ -33,7 +33,7 @@ ISAAC_BIMANUAL_PLAN_ROWS = 30   # replan every second instead of running the ful
 # Committed actions (RTC) are on for every family except these. TEMPORARY EXCEPTION: their Orchestral
 # plugins do not support committed actions yet, so they default to off and opt in with
 # --committed-actions. Remove a family from this set when its plugin supports them.
-COMMITTED_ACTIONS_DEFAULT_OFF = frozenset({"rho", "dreamzero", "fastwam", "dw05", "aw0"})
+COMMITTED_ACTIONS_DEFAULT_OFF = frozenset({"rho", "dreamzero"})
 # Families fine-tuned on the Holesaw task. None has a noise-seed path.
 HOLESAW_INSTRUCTION = "Pick up the hole saws from the moving conveyor belt and place them in the red case"
 HOLESAW_FINE_TUNED_FAMILIES = frozenset({"rho", "dreamzero", "fastwam", "dw05", "aw0"})

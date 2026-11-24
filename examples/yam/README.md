@@ -309,7 +309,7 @@ the arm holds the last target until it arrives.
 
 Committed actions (RTC) are on by default for every family of `managed_rollout.py`; there is no
 opt-out flag. Every Worker and plugin must support them. The one temporary exception is the
-Holesaw families `rho`, `dreamzero`, `fastwam`, `dw05` and `aw0` (`COMMITTED_ACTIONS_DEFAULT_OFF`),
+Holesaw families `rho` and `dreamzero` (`COMMITTED_ACTIONS_DEFAULT_OFF`),
 which run without committed actions until their plugins support them; pass `--committed-actions`
 to opt in. The launcher commits the queued robot
 commands with splice prefetch, in the Worker's own action space (joint rows, padded rows, or tool

@@ -404,9 +404,9 @@ def _rollout_settings(family, tmp_path, monkeypatch, **extra):
 
 
 def test_committed_actions_rule_and_its_temporary_exceptions(tmp_path, monkeypatch):
-    """On for every family; only the five Holesaw families are default-off until their plugins support it."""
+    """On for every family; only the two Holesaw families are default-off until their plugins support it."""
     assert set(IDENTITIES) | {"pi05"} == set(_families()), "a new family needs an entry in IDENTITIES and its tests"
-    assert managed_rollout.COMMITTED_ACTIONS_DEFAULT_OFF == {"rho", "dreamzero", "fastwam", "dw05", "aw0"}
+    assert managed_rollout.COMMITTED_ACTIONS_DEFAULT_OFF == {"rho", "dreamzero"}
     for family in IDENTITIES:
         saved = _rollout_settings(family, tmp_path, monkeypatch)
         if family in managed_rollout.COMMITTED_ACTIONS_DEFAULT_OFF:
