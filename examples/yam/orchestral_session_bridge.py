@@ -37,18 +37,7 @@ SINGLE_ARM_IN_14 = "single_arm_in_14"
 PRAXIS_HOLESAW_BIMANUAL = "praxis_holesaw_bimanual"
 TEMPORAL_JOINT_ADAPTER = "temporal_joint"
 GR00T_YAM_ADAPTER = "gr00t_yam"
-# The Holesaw GR00T checkpoint normalizes the gripper within about [0, 0.96]; a Worker that predates the clamp
-# (PR #2661) rejects committed gripper rows outside it, and the YAM rollout commits 1.0 for a fully open gripper.
-# The Worker is conditioned on the clamped rows; the chunk handed back still carries the rows the robot executes.
-GR00T_COMMITTED_GRIPPER_RANGE = (0.0, 0.95)
-
-
-def gr00t_conditioning_prefix(prefix):
-    """The committed rows a Worker is conditioned on: the gripper clamped into the checkpoint's range."""
-    import numpy as np
-    conditioned = np.array(prefix, dtype=np.float32, copy=True)
-    conditioned[:, 6] = np.clip(conditioned[:, 6], *GR00T_COMMITTED_GRIPPER_RANGE)
-    return conditioned
+from committed_range import gr00t_conditioning_prefix  # noqa: E402
 NOISE_SCHEME = "numpy-pcg64-15x32-fp32-v1"
 
 

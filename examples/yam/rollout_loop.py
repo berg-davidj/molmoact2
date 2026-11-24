@@ -22,6 +22,7 @@ import rerun as rr
 import rerun.blueprint as rrb
 
 from chunk_fusion import MODES as CHUNK_FUSION_MODES, ChunkPlan
+from committed_range import gr00t_conditioning_prefix
 from gripper_aperture import clip_predicted_aperture
 from rollout_trace import COMMAND_STAGES, PREDICTION_OUTCOMES, PREDICTION_STAGES, TICK_STAGE, RolloutTrace
 import run_recording
@@ -71,6 +72,9 @@ def checked_chunk(session, cameras, state, instruction, *, episode_start, action
             # The inactive half of the model has the same fixed command as its input state.
             parked = np.broadcast_to(state_padding, (len(committed_actions), len(state_padding)))
             committed_actions = np.concatenate([committed_actions, parked], axis=1)
+        executed_actions = committed_actions
+        if model_label == "GR00T":
+            committed_actions = gr00t_conditioning_prefix(executed_actions)
         sensors["committed_actions"] = committed_actions
     if noise_seed is not None:
         sensors["noise_seed"] = noise_seed
@@ -88,6 +92,8 @@ def checked_chunk(session, cameras, state, instruction, *, episode_start, action
         raise ValueError(f"{model_label} returned an invalid action chunk")
     if committed_actions is not None and not np.array_equal(chunk[:len(committed_actions)], committed_actions):
         raise ValueError(f"{model_label} did not preserve the committed action prefix")
+    if committed_actions is not None:
+        chunk[:len(committed_actions)] = executed_actions
     chunk = chunk[:max_plan_rows]
     if state_padding is not None:
         chunk = chunk[:, :len(state)]
