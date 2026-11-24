@@ -37,6 +37,18 @@ SINGLE_ARM_IN_14 = "single_arm_in_14"
 PRAXIS_HOLESAW_BIMANUAL = "praxis_holesaw_bimanual"
 TEMPORAL_JOINT_ADAPTER = "temporal_joint"
 GR00T_YAM_ADAPTER = "gr00t_yam"
+# The Holesaw GR00T checkpoint normalizes the gripper within about [0, 0.96]; a Worker that predates the clamp
+# (PR #2661) rejects committed gripper rows outside it, and the YAM rollout commits 1.0 for a fully open gripper.
+# The Worker is conditioned on the clamped rows; the chunk handed back still carries the rows the robot executes.
+GR00T_COMMITTED_GRIPPER_RANGE = (0.0, 0.95)
+
+
+def gr00t_conditioning_prefix(prefix):
+    """The committed rows a Worker is conditioned on: the gripper clamped into the checkpoint's range."""
+    import numpy as np
+    conditioned = np.array(prefix, dtype=np.float32, copy=True)
+    conditioned[:, 6] = np.clip(conditioned[:, 6], *GR00T_COMMITTED_GRIPPER_RANGE)
+    return conditioned
 NOISE_SCHEME = "numpy-pcg64-15x32-fp32-v1"
 
 
@@ -731,6 +743,7 @@ class OrchestralSessionHost:
             raise OrchestralBridgeError("Orchestral session is not open")
         inputs, query_state = self.predict_inputs(images, state)
         prefix = None
+        executed_prefix = None
         if committed_actions is not None:
             prefix = np.array(committed_actions, dtype=np.float32, copy=True)
             max_prefix = self.identity["action_horizon"]
@@ -746,6 +759,9 @@ class OrchestralSessionHost:
                 # this request's observation as the origin for joint deltas.
                 prefix[:, :6] -= query_state[:6]
                 prefix[:, 6] = 1.0 - prefix[:, 6]
+            if self.policy_adapter == GR00T_YAM_ADAPTER:
+                executed_prefix = prefix.copy()
+                prefix = gr00t_conditioning_prefix(prefix)
         started_ns = time.time_ns()
         started_at = time.monotonic_ns()
         with _quic_snapshots():
@@ -761,6 +777,10 @@ class OrchestralSessionHost:
         actions = np.asarray(result.actions, dtype=np.float32).copy()
         if actions.shape != (self.identity["action_horizon"], self.identity["action_dim"]) or not np.isfinite(actions).all():
             raise OrchestralBridgeError("actions must be finite and match the endpoint shape")
+        if prefix is not None and executed_prefix is not None:
+            if not np.array_equal(actions[:len(prefix)], prefix):
+                raise OrchestralBridgeError("the Worker did not preserve the committed action prefix")
+            actions[:len(prefix)] = executed_prefix
         actions = self.robot_actions(actions, query_state)
         timings = asdict(result.timings)
         return {"actions": actions.tolist(), "horizon": len(actions),
